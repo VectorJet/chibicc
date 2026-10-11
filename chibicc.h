@@ -412,6 +412,14 @@ void codegen(Obj *prog, FILE *out);
 int align_to(int n, int align);
 
 //
+// llvm_backend.c (opt-in with --backend=llvm)
+//
+
+extern bool opt_backend_llvm;
+extern char *opt_target;
+void llvm_codegen(Obj *prog, char *output_path, char *target);
+
+//
 // unicode.c
 //
 
