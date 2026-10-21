@@ -6,16 +6,23 @@
 // supported subset is reported as a diagnostic. Nothing is silently dropped or
 // approximated.
 //
-// Supported: integer and pointer scalars as locals, parameters and globals;
-// direct calls; integer arithmetic, bitwise and comparison operators; pointer
-// comparison; short-circuit && and ||; ?:; casts between integer types and
-// to/from bool; assignment and compound assignment (chibicc desugars the latter
-// through ND_ADDR/ND_DEREF, which are handled here); if, for, while, do/while,
-// break, continue and return.
+// Supported: integer and pointer scalars and fixed-size arrays as locals,
+// parameters and globals (including string literals and global initializers
+// that hold addresses of other globals or functions); direct calls; integer
+// arithmetic, bitwise and comparison operators; pointer arithmetic, pointer
+// difference and comparison; integer/pointer casts; short-circuit && and ||;
+// ?:; casts between integer types and to/from bool; assignment and compound
+// assignment (chibicc desugars the latter through ND_ADDR/ND_DEREF, which are
+// handled here); if, for, while, do/while, switch (including GNU case ranges),
+// goto and labels, break, continue and return; GNU statement expressions.
 //
-// Not supported yet (diagnosed): floating point, aggregates, arrays, pointer
-// arithmetic, indirect calls, switch, goto, statement expressions, thread-local
-// variables, and anything else not listed above.
+// Arrays are stored as byte arrays ([N x i8]); elements are accessed through
+// byte-offset GEPs, which is what the frontend's pre-scaled pointer arithmetic
+// produces.
+//
+// Not supported yet (diagnosed): floating point, structs and unions, VLAs,
+// indirect calls, computed goto, thread-local variables, and anything else not
+// listed above.
 
 #include "chibicc.h"
 
@@ -42,11 +49,11 @@ struct Binding {
   Binding *next;
 };
 
-typedef struct LoopLabel LoopLabel;
-struct LoopLabel {
+typedef struct Label Label;
+struct Label {
   char *name;
   LLVMBasicBlockRef bb;
-  LoopLabel *next;
+  Label *next;
 };
 
 static LLVMContextRef ctx;
@@ -54,9 +61,10 @@ static LLVMModuleRef mod;
 static LLVMBuilderRef bld;
 static LLVMTargetMachineRef tm;
 
+static Obj *program;          // all top-level objects, for resolving relocations
 static Binding *global_binds; // global variables and functions
 static Binding *local_binds;  // locals of the function being emitted
-static LoopLabel *loop_labels; // break/continue targets of enclosing loops
+static Label *labels;         // blocks of the function being emitted, by unique label
 static LLVMValueRef cur_fn;
 static Type *cur_ret_ty;
 
@@ -120,6 +128,30 @@ static LLVMTypeRef scalar_type(Type *ty) {
   if (ty->kind == TY_PTR)
     return LLVMPointerTypeInContext(ctx, 0);
   return NULL;
+}
+
+static bool is_array(Type *ty) {
+  return ty->kind == TY_ARRAY && !ty->is_atomic && ty->size >= 0;
+}
+
+// Types that can live in memory: scalars and fixed-size arrays.
+static bool is_storable(Type *ty) {
+  return is_scalar(ty) || is_array(ty);
+}
+
+static LLVMTypeRef i8_type(void) {
+  return LLVMInt8TypeInContext(ctx);
+}
+
+static LLVMTypeRef i64_type(void) {
+  return LLVMInt64TypeInContext(ctx);
+}
+
+// LLVM type of an object's storage. Arrays are opaque byte arrays.
+static LLVMTypeRef storage_type(Type *ty) {
+  if (is_array(ty))
+    return LLVMArrayType2(i8_type(), ty->size);
+  return scalar_type(ty);
 }
 
 static LLVMTypeRef function_type(Type *fty, Token *tok) {
@@ -204,21 +236,124 @@ static uint64_t read_le(char *p, int size) {
   return v;
 }
 
+static LLVMValueRef bytes_const(char *p, int len) {
+  return LLVMConstStringInContext2(ctx, p, len, true);
+}
+
+// Initializer of a global without relocations.
+static LLVMValueRef plain_initializer(Obj *var, LLVMTypeRef ty) {
+  if (!var->init_data)
+    return LLVMConstNull(ty);
+  if (is_array(var->ty))
+    return bytes_const(var->init_data, var->ty->size);
+
+  uint64_t v = read_le(var->init_data, var->ty->size);
+  if (var->ty->kind == TY_PTR)
+    return v ? LLVMConstIntToPtr(LLVMConstInt(i64_type(), v, false), ty) : LLVMConstNull(ty);
+  return LLVMConstInt(ty, v, false);
+}
+
+// The frontend serializes every relocated word as 8 bytes.
+#define RELOC_SIZE 8
+
+// A global whose initializer holds addresses (e.g. `char *s = "abc";` or a
+// table of pointers) is laid out as a packed struct of byte runs and pointers.
+// Its type is computed first so the global can be bound before its
+// initializer is built; the initializer may refer back to the global itself.
+static LLVMTypeRef relocated_type(Obj *var) {
+  int nrel = 0;
+  for (Relocation *r = var->rel; r; r = r->next)
+    nrel++;
+
+  // Each relocation contributes at most a byte run and a pointer.
+  LLVMTypeRef *elems = calloc(2 * nrel + 1, sizeof(LLVMTypeRef));
+  int n = 0, pos = 0;
+  for (Relocation *r = var->rel; r; r = r->next) {
+    if (r->offset < pos)
+      unsupported(var->tok, format("overlapping relocations in '%s'", var->name));
+    if (r->offset > pos)
+      elems[n++] = LLVMArrayType2(i8_type(), r->offset - pos);
+    elems[n++] = LLVMPointerTypeInContext(ctx, 0);
+    pos = r->offset + RELOC_SIZE;
+  }
+  if (pos < var->ty->size)
+    elems[n++] = LLVMArrayType2(i8_type(), var->ty->size - pos);
+  return LLVMStructTypeInContext(ctx, elems, n, true);
+}
+
+static Obj *find_toplevel(char *name) {
+  for (Obj *o = program; o; o = o->next)
+    if (!strcmp(o->name, name))
+      return o;
+  return NULL;
+}
+
+static LLVMValueRef relocated_initializer(Obj *var, LLVMTypeRef ty) {
+  int n = LLVMCountStructElementTypes(ty);
+  LLVMValueRef *vals = calloc(n, sizeof(LLVMValueRef));
+  int i = 0, pos = 0;
+  for (Relocation *r = var->rel; r; r = r->next) {
+    if (r->offset > pos)
+      vals[i++] = bytes_const(var->init_data + pos, r->offset - pos);
+
+    Obj *target = find_toplevel(*r->label);
+    if (!target)
+      unsupported(var->tok, format("address of label in initializer of '%s'", var->name));
+    LLVMValueRef base = target->is_function ? get_function(target, var->tok) : get_global(target);
+    if (r->addend) {
+      LLVMValueRef off = LLVMConstInt(i64_type(), r->addend, true);
+      base = LLVMConstGEP2(i8_type(), base, &off, 1);
+    }
+    vals[i++] = base;
+    pos = r->offset + RELOC_SIZE;
+  }
+  if (pos < var->ty->size)
+    vals[i++] = bytes_const(var->init_data + pos, var->ty->size - pos);
+  return LLVMConstStructInContext(ctx, vals, n, true);
+}
+
+// The frontend creates a separate Obj for every file-scope declaration of a
+// variable: extern declarations, tentative definitions and the definition.
+// scan_globals drops tentative definitions made redundant by a definition, but
+// the AST can still refer to any of them. They all denote one object: the
+// definition if there is one, else a surviving tentative definition.
+static Obj *canonical_global(Obj *var) {
+  Obj *best = var;
+  for (Obj *o = program; o; o = o->next) {
+    if (o->is_function || strcmp(o->name, var->name))
+      continue;
+    if (o->is_definition && !o->is_tentative)
+      return o;
+    if (o->is_tentative)
+      best = o;
+  }
+  return best;
+}
+
 // Globals are created on first reference. chibicc also creates anonymous
 // string-literal globals (including one for __func__ in every function), and
-// eagerly lowering all of them would reject ordinary programs.
+// eagerly lowering all of them would emit unused data.
 static LLVMValueRef get_global(Obj *var) {
   LLVMValueRef g = find_binding(global_binds, var);
   if (g)
     return g;
 
+  Obj *canon = canonical_global(var);
+  if (canon != var) {
+    g = get_global(canon);
+    add_binding(&global_binds, var, g);
+    return g;
+  }
+
   if (var->is_tls)
     unsupported(var->tok, format("thread-local variable '%s'", var->name));
-  if (!is_scalar(var->ty))
+  if (!is_storable(var->ty))
     unsupported(var->tok, format("variable '%s' of type %s", var->name, type_name(var->ty)));
 
-  LLVMTypeRef ty = scalar_type(var->ty);
+  bool has_storage = var->is_definition || var->is_tentative;
+  LLVMTypeRef ty = (has_storage && var->rel) ? relocated_type(var) : storage_type(var->ty);
   g = LLVMAddGlobal(mod, ty, var->name);
+  add_binding(&global_binds, var, g);
 
   if (var->is_static)
     LLVMSetLinkage(g, LLVMInternalLinkage);
@@ -230,17 +365,9 @@ static LLVMValueRef get_global(Obj *var) {
   if (var->align > 0)
     LLVMSetAlignment(g, var->align);
 
-  if (!var->is_definition && !var->is_tentative) {
-    // extern declaration: no storage is emitted here.
-  } else if (var->rel) {
-    unsupported(var->tok, format("pointer-initialized global '%s'", var->name));
-  } else if (var->init_data && var->ty->kind != TY_PTR) {
-    LLVMSetInitializer(g, LLVMConstInt(ty, read_le(var->init_data, var->ty->size), false));
-  } else {
-    LLVMSetInitializer(g, LLVMConstNull(ty));
-  }
-
-  add_binding(&global_binds, var, g);
+  // extern declarations get no initializer, so no storage is emitted here.
+  if (has_storage)
+    LLVMSetInitializer(g, var->rel ? relocated_initializer(var, ty) : plain_initializer(var, ty));
   return g;
 }
 
@@ -264,7 +391,7 @@ static LLVMValueRef get_function(Obj *fn, Token *tok) {
 static LLVMValueRef var_addr(Obj *var, Token *tok) {
   if (var->ty->kind == TY_FUNC)
     return get_function(var, tok);
-  if (!is_scalar(var->ty))
+  if (!is_storable(var->ty))
     unsupported(tok, format("variable '%s' of type %s", var->name, type_name(var->ty)));
 
   LLVMValueRef v = var->is_local ? find_binding(local_binds, var) : get_global(var);
@@ -301,23 +428,34 @@ static void ensure_open(void) {
     position(new_block("unreachable"));
 }
 
+// Labels are the frontend's unique label names: break/continue targets of
+// loops and switches, case labels, and user labels. A goto may precede its
+// label, so label blocks are created on first reference.
 static void add_label(char *name, LLVMBasicBlockRef bb) {
   if (!name)
     return;
-  LoopLabel *l = calloc(1, sizeof(LoopLabel));
+  Label *l = calloc(1, sizeof(Label));
   l->name = name;
   l->bb = bb;
-  l->next = loop_labels;
-  loop_labels = l;
+  l->next = labels;
+  labels = l;
 }
 
-static LLVMBasicBlockRef find_label(char *name) {
-  if (!name)
-    return NULL;
-  for (LoopLabel *l = loop_labels; l; l = l->next)
+static LLVMBasicBlockRef label_block(char *name) {
+  for (Label *l = labels; l; l = l->next)
     if (!strcmp(l->name, name))
       return l->bb;
-  return NULL;
+  LLVMBasicBlockRef bb = new_block("label");
+  add_label(name, bb);
+  return bb;
+}
+
+// Ends the current block by falling through into a labeled block and continues
+// emitting there.
+static void enter_label(char *name) {
+  LLVMBasicBlockRef bb = label_block(name);
+  branch_if_open(bb);
+  position(bb);
 }
 
 //
@@ -345,23 +483,25 @@ static LLVMValueRef int_coerce(LLVMValueRef v, LLVMTypeRef want, bool src_unsign
 static LLVMValueRef convert(LLVMValueRef v, Type *to, Type *from, Token *tok) {
   if (!v)
     unsupported(tok, "use of a void value");
+  // An array value is already the address of its first element.
+  if (is_array(from) && to->kind == TY_PTR)
+    return v;
   if (!is_scalar(to) || !is_scalar(from))
     unsupported(tok, format("conversion from %s to %s", type_name(from), type_name(to)));
 
   if (to->kind == TY_PTR) {
     if (from->kind == TY_PTR)
       return v;
-    // A null pointer constant (an integer constant expression with value 0)
-    // converts to the null pointer. Other integer-to-pointer conversions are not
-    // supported yet.
+    // Keep null pointer constants as `null` rather than `inttoptr 0`.
     if (LLVMIsAConstantInt(v) && LLVMConstIntGetZExtValue(v) == 0)
       return LLVMConstNull(scalar_type(to));
-    unsupported(tok, "conversion from non-null integer to pointer");
+    return LLVMBuildIntToPtr(bld, int_coerce(v, i64_type(), from->is_unsigned),
+                             scalar_type(to), "");
   }
   if (to->kind == TY_BOOL)
     return LLVMBuildZExt(bld, to_bool(v), scalar_type(to), "");
   if (from->kind == TY_PTR)
-    unsupported(tok, "conversion from pointer to integer");
+    return LLVMBuildPtrToInt(bld, v, scalar_type(to), "");
   return int_coerce(v, scalar_type(to), from->is_unsigned);
 }
 
@@ -382,9 +522,48 @@ static LLVMValueRef gen_int(Node *node) {
   return gen_value(node);
 }
 
-static LLVMValueRef gen_arith(Node *node) {
-  if (!is_integer(node->ty) || !is_integer(node->lhs->ty) || !is_integer(node->rhs->ty))
+static bool is_address(Type *ty) {
+  return ty->kind == TY_PTR || is_array(ty);
+}
+
+// Byte offset operand of pointer arithmetic as an i64. The frontend has
+// already scaled it by the element size, and for `p + n` the usual arithmetic
+// conversions wrapped it in a cast to the pointer type, which is looked
+// through here so the result can be a GEP instead of an inttoptr.
+static LLVMValueRef byte_offset(Node *node) {
+  if (node->kind == ND_CAST && node->ty->kind == TY_PTR && is_integer(node->lhs->ty))
+    node = node->lhs;
+  if (!is_integer(node->ty))
+    unsupported(node->tok, format("pointer offset of type %s", type_name(node->ty)));
+  return int_coerce(gen_value(node), i64_type(), node->ty->is_unsigned);
+}
+
+// ptr + n, ptr - n and ptr - ptr. The frontend divides a pointer difference by
+// the element size with a separate ND_DIV, so ptr - ptr yields bytes here.
+static LLVMValueRef gen_ptr_arith(Node *node) {
+  if (node->kind == ND_SUB && is_integer(node->ty)) {
+    if (!is_address(node->lhs->ty) || !is_address(node->rhs->ty))
+      unsupported(node->tok, "pointer arithmetic");
+    LLVMValueRef l = LLVMBuildPtrToInt(bld, gen_value(node->lhs), i64_type(), "");
+    LLVMValueRef r = LLVMBuildPtrToInt(bld, gen_value(node->rhs), i64_type(), "");
+    return int_coerce(LLVMBuildSub(bld, l, r, ""), scalar_type(node->ty), false);
+  }
+
+  if ((node->kind != ND_ADD && node->kind != ND_SUB) || !is_address(node->lhs->ty))
     unsupported(node->tok, "pointer arithmetic");
+
+  LLVMValueRef base = gen_value(node->lhs);
+  LLVMValueRef off = byte_offset(node->rhs);
+  if (node->kind == ND_SUB)
+    off = LLVMBuildNeg(bld, off, "");
+  return LLVMBuildGEP2(bld, i8_type(), base, &off, 1, "");
+}
+
+static LLVMValueRef gen_arith(Node *node) {
+  if (is_address(node->ty) || is_address(node->lhs->ty))
+    return gen_ptr_arith(node);
+  if (!is_integer(node->ty) || !is_integer(node->lhs->ty) || !is_integer(node->rhs->ty))
+    unsupported(node->tok, format("arithmetic on %s", type_name(node->ty)));
 
   LLVMValueRef l = gen_value(node->lhs);
   LLVMValueRef r = int_coerce(gen_value(node->rhs), LLVMTypeOf(l), node->rhs->ty->is_unsigned);
@@ -513,7 +692,9 @@ static LLVMValueRef gen_call(Node *node) {
   Type *param = node->func_ty ? node->func_ty->params : NULL;
   int i = 0;
   for (Node *a = node->args; a; a = a->next, i++) {
-    if (!is_scalar(a->ty))
+    // Arrays only reach here as variadic arguments, which the frontend does
+    // not convert; their value is already the decayed pointer.
+    if (!is_scalar(a->ty) && !is_array(a->ty))
       unsupported(a->tok, format("argument of type %s", type_name(a->ty)));
     LLVMValueRef v = gen_value(a);
     if (param) {
@@ -540,9 +721,11 @@ static LLVMValueRef gen_addr(Node *node) {
   case ND_VAR:
     return var_addr(node->var, node->tok);
   case ND_DEREF:
-    if (node->lhs->ty->kind != TY_PTR)
+    if (!is_address(node->lhs->ty))
       unsupported(node->tok, "dereference of a non-pointer");
     return gen_value(node->lhs);
+  case ND_MEMBER:
+    unsupported(node->tok, "struct or union member access");
   default:
     unsupported(node->tok, format("address of or assignment to %s", tok_text(node->tok)));
   }
@@ -566,13 +749,20 @@ static LLVMValueRef gen_expr(Node *node) {
   case ND_VAR:
     if (node->var->ty->kind == TY_FUNC)
       unsupported(node->tok, "function used as a value");
+    // The value of an array is the address of its first element.
+    if (is_array(node->ty))
+      return var_addr(node->var, node->tok);
     if (!is_scalar(node->ty))
       unsupported(node->tok, format("variable '%s' of type %s", node->var->name, type_name(node->ty)));
     return LLVMBuildLoad2(bld, scalar_type(node->ty), var_addr(node->var, node->tok), "");
 
   case ND_DEREF:
-    if (node->lhs->ty->kind != TY_PTR)
+    if (!is_address(node->lhs->ty))
       unsupported(node->tok, "dereference of a non-pointer");
+    // Dereferencing a pointer to an array (e.g. a row of a 2D array) yields
+    // the array, whose value is its address.
+    if (is_array(node->ty))
+      return gen_value(node->lhs);
     if (!is_scalar(node->ty))
       unsupported(node->tok, format("dereference of %s", type_name(node->ty)));
     return LLVMBuildLoad2(bld, scalar_type(node->ty), gen_value(node->lhs), "");
@@ -594,9 +784,14 @@ static LLVMValueRef gen_expr(Node *node) {
     Obj *var = node->var;
     if (!var)
       unsupported(node->tok, "zero-initialization without a variable");
-    if (!is_scalar(var->ty))
+    if (!is_storable(var->ty))
       unsupported(node->tok, format("variable '%s' of type %s", var->name, type_name(var->ty)));
-    LLVMBuildStore(bld, LLVMConstNull(scalar_type(var->ty)), var_addr(var, node->tok));
+    LLVMValueRef addr = var_addr(var, node->tok);
+    if (is_array(var->ty))
+      LLVMBuildMemSet(bld, addr, LLVMConstNull(i8_type()),
+                      LLVMConstInt(i64_type(), var->ty->size, false), var->align);
+    else
+      LLVMBuildStore(bld, LLVMConstNull(scalar_type(var->ty)), addr);
     return NULL;
   }
 
@@ -648,6 +843,21 @@ static LLVMValueRef gen_expr(Node *node) {
 
   case ND_FUNCALL:
     return gen_call(node);
+
+  case ND_MEMBER:
+    unsupported(node->tok, "struct or union member access");
+
+  case ND_STMT_EXPR:
+    // [GNU] ({ ... }) has the value of its last statement, which the frontend
+    // guarantees is an expression statement.
+    for (Node *n = node->body; n; n = n->next) {
+      if (!n->next && n->kind == ND_EXPR_STMT) {
+        ensure_open();
+        return gen_expr(n->lhs);
+      }
+      gen_stmt(n);
+    }
+    return NULL;
 
   default:
     unsupported(node->tok, format("expression %s", tok_text(node->tok)));
@@ -742,6 +952,56 @@ static void gen_do(Node *node) {
   position(end_bb);
 }
 
+static bool case_value_used(Node *sw, Node *upto, long val) {
+  for (Node *n = sw->case_next; n != upto; n = n->case_next)
+    if (n->begin == n->end && n->begin == val)
+      return true;
+  return false;
+}
+
+// Case ranges are tested with compare-and-branch before the switch
+// instruction, which handles the single-value cases.
+static void gen_switch(Node *node) {
+  Type *ty = node->cond->ty;
+  if (!is_integer(ty))
+    unsupported(node->cond->tok, format("switch on %s", type_name(ty)));
+
+  // The controlling expression undergoes integer promotion.
+  LLVMTypeRef cty = scalar_type(ty->size < 4 ? ty_int : ty);
+  LLVMValueRef c = int_coerce(gen_value(node->cond), cty, ty->is_unsigned);
+
+  LLVMBasicBlockRef end_bb = new_block("sw.end");
+  add_label(node->brk_label, end_bb);
+  LLVMBasicBlockRef default_bb = node->default_case ? label_block(node->default_case->label) : end_bb;
+
+  int nsingle = 0;
+  for (Node *n = node->case_next; n; n = n->case_next) {
+    if (n->begin == n->end) {
+      nsingle++;
+      continue;
+    }
+    LLVMValueRef diff = LLVMBuildSub(bld, c, LLVMConstInt(cty, n->begin, true), "");
+    LLVMValueRef in_range =
+      LLVMBuildICmp(bld, LLVMIntULE, diff, LLVMConstInt(cty, n->end - n->begin, false), "");
+    LLVMBasicBlockRef next = new_block("sw.range");
+    LLVMBuildCondBr(bld, in_range, label_block(n->label), next);
+    position(next);
+  }
+
+  LLVMValueRef sw = LLVMBuildSwitch(bld, c, default_bb, nsingle);
+  for (Node *n = node->case_next; n; n = n->case_next) {
+    if (n->begin != n->end)
+      continue;
+    if (case_value_used(node, n, n->begin))
+      error_tok(n->tok, "duplicate case value");
+    LLVMAddCase(sw, LLVMConstInt(cty, n->begin, true), label_block(n->label));
+  }
+
+  gen_stmt(node->then);
+  branch_if_open(end_bb);
+  position(end_bb);
+}
+
 static void gen_stmt(Node *node) {
   ensure_open();
 
@@ -767,15 +1027,21 @@ static void gen_stmt(Node *node) {
   case ND_DO:
     gen_do(node);
     return;
-  case ND_GOTO: {
-    // break and continue are ND_GOTO nodes whose target is a loop label.
-    // User-written goto is not supported yet.
-    LLVMBasicBlockRef target = find_label(node->unique_label);
-    if (!target)
-      unsupported(node->tok, "goto (only break and continue are supported)");
-    LLVMBuildBr(bld, target);
+  case ND_SWITCH:
+    gen_switch(node);
     return;
-  }
+  case ND_CASE:
+    enter_label(node->label);
+    gen_stmt(node->lhs);
+    return;
+  case ND_LABEL:
+    enter_label(node->unique_label);
+    gen_stmt(node->lhs);
+    return;
+  case ND_GOTO:
+    // Also used for break and continue, whose targets are loop labels.
+    LLVMBuildBr(bld, label_block(node->unique_label));
+    return;
   default:
     unsupported(node->tok, format("statement %s", tok_text(node->tok)));
   }
@@ -790,17 +1056,18 @@ static void emit_function(Obj *fn) {
   cur_fn = f;
   cur_ret_ty = fn->ty->return_ty;
   local_binds = NULL;
-  loop_labels = NULL;
+  labels = NULL;
 
   LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, f, "entry");
   position(entry);
 
-  // Every local gets a stack slot in the entry block. Only scalars are
-  // supported; other locals are diagnosed if they are referenced.
+  // Every local gets a stack slot in the entry block. Only scalars and
+  // fixed-size arrays are supported; other locals are diagnosed if they are
+  // referenced.
   for (Obj *v = fn->locals; v; v = v->next) {
-    if (!is_scalar(v->ty))
+    if (!is_storable(v->ty))
       continue;
-    LLVMValueRef slot = LLVMBuildAlloca(bld, scalar_type(v->ty), "");
+    LLVMValueRef slot = LLVMBuildAlloca(bld, storage_type(v->ty), "");
     if (v->align > 0)
       LLVMSetAlignment(slot, v->align);
     add_binding(&local_binds, v, slot);
@@ -851,6 +1118,8 @@ void llvm_codegen(Obj *prog, char *output_path, char *target) {
   LLVMSetDataLayout(mod, dl);
   LLVMDisposeMessage(dl);
   LLVMDisposeTargetData(td);
+
+  program = prog;
 
   // Externally visible definitions are always emitted, or rejected if their
   // type is unsupported. Static objects (string literals, __func__, static
