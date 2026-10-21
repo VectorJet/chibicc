@@ -5,7 +5,7 @@ struct Flags {
   _Bool c : 1;
   unsigned long d : 40;
   short : 0;
-  char e : 4;
+  signed char e : 4;
 };
 
 struct Flags global_flags = {5, -3, 1, 0x123456789, 7};

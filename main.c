@@ -53,6 +53,31 @@ static bool take_arg(char *arg) {
   return false;
 }
 
+// Directory of the target's multiarch system headers. The legacy backend
+// always emits x86-64; the LLVM backend targets the host.
+static char *multiarch_include_dir = "/usr/include/x86_64-linux-gnu";
+
+// The LLVM backend compiles for the host, so the predefined macros, system
+// headers and the signedness of plain char must be the host's.
+static void configure_host_target(void) {
+  define_macro("__chibicc_llvm__", "1");
+  define_macro("__SIZEOF_INT128__", "16");
+  define_macro("__int128_t", "__int128");
+  define_macro("__uint128_t", "unsigned __int128");
+
+#if defined(__aarch64__)
+  undef_macro("__x86_64");
+  undef_macro("__x86_64__");
+  undef_macro("__amd64");
+  undef_macro("__amd64__");
+  define_macro("__aarch64__", "1");
+  define_macro("__ARM_64BIT_STATE", "1");
+  define_macro("__CHAR_UNSIGNED__", "1");
+  ty_char->is_unsigned = true;
+  multiarch_include_dir = "/usr/include/aarch64-linux-gnu";
+#endif
+}
+
 static void add_default_include_paths(char *argv0) {
   // We expect that chibicc-specific include files are installed
   // to ./include relative to argv[0].
@@ -60,7 +85,7 @@ static void add_default_include_paths(char *argv0) {
 
   // Add standard include paths.
   strarray_push(&include_paths, "/usr/local/include");
-  strarray_push(&include_paths, "/usr/include/x86_64-linux-gnu");
+  strarray_push(&include_paths, multiarch_include_dir);
   strarray_push(&include_paths, "/usr/include");
 
   // Keep a copy of the standard include paths for -MMD option.
@@ -370,6 +395,7 @@ static void parse_args(int argc, char **argv) {
 #endif
     if (opt_S)
       error("-S is not supported with --backend=llvm");
+    configure_host_target();
   }
 
   // -E implies that the input is the C macro language.

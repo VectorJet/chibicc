@@ -395,6 +395,7 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     OTHER    = 1 << 16,
     SIGNED   = 1 << 17,
     UNSIGNED = 1 << 18,
+    INT128   = 1 << 19,
   };
 
   Type *ty = ty_int;
@@ -494,6 +495,8 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       counter += INT;
     else if (equal(tok, "long"))
       counter += LONG;
+    else if (equal(tok, "__int128"))
+      counter += INT128;
     else if (equal(tok, "float"))
       counter += FLOAT;
     else if (equal(tok, "double"))
@@ -513,8 +516,10 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
       ty = ty_bool;
       break;
     case CHAR:
-    case SIGNED + CHAR:
       ty = ty_char;
+      break;
+    case SIGNED + CHAR:
+      ty = ty_schar;
       break;
     case UNSIGNED + CHAR:
       ty = ty_uchar;
@@ -553,6 +558,13 @@ static Type *declspec(Token **rest, Token *tok, VarAttr *attr) {
     case UNSIGNED + LONG + LONG:
     case UNSIGNED + LONG + LONG + INT:
       ty = ty_ulong;
+      break;
+    case INT128:
+    case SIGNED + INT128:
+      ty = ty_int128;
+      break;
+    case UNSIGNED + INT128:
+      ty = ty_uint128;
       break;
     case FLOAT:
       ty = ty_float;
@@ -678,10 +690,16 @@ static Type *pointers(Token **rest, Token *tok, Type *ty) {
 }
 
 // declarator = pointers ("(" ident ")" | "(" declarator ")" | ident) type-suffix
+// In `void (char *)` or `int ()`, the parenthesis starts a parameter list of
+// an unnamed function declarator rather than a nested declarator.
+static bool starts_param_list(Token *tok) {
+  return equal(tok, "(") && (equal(tok->next, ")") || is_typename(tok->next));
+}
+
 static Type *declarator(Token **rest, Token *tok, Type *ty) {
   ty = pointers(&tok, tok, ty);
 
-  if (equal(tok, "(")) {
+  if (equal(tok, "(") && !starts_param_list(tok)) {
     Token *start = tok;
     Type dummy = {};
     declarator(&tok, start->next, &dummy);
@@ -708,7 +726,7 @@ static Type *declarator(Token **rest, Token *tok, Type *ty) {
 static Type *abstract_declarator(Token **rest, Token *tok, Type *ty) {
   ty = pointers(&tok, tok, ty);
 
-  if (equal(tok, "(")) {
+  if (equal(tok, "(") && !starts_param_list(tok)) {
     Token *start = tok;
     Type dummy = {};
     abstract_declarator(&tok, start->next, &dummy);
@@ -1490,6 +1508,11 @@ write_gvar_data(Relocation *cur, Initializer *init, Type *ty, char *buf, int off
     return cur;
   }
 
+  if (ty->kind == TY_LDOUBLE) {
+    *(long double *)(buf + offset) = eval_double(init->expr);
+    return cur;
+  }
+
   char **label = NULL;
   uint64_t val = eval2(init->expr, &label);
 
@@ -1530,7 +1553,7 @@ static bool is_typename(Token *tok) {
       "typedef", "enum", "static", "extern", "_Alignas", "signed", "unsigned",
       "const", "volatile", "auto", "register", "restrict", "__restrict",
       "__restrict__", "_Noreturn", "float", "double", "typeof", "inline",
-      "_Thread_local", "__thread", "_Atomic",
+      "_Thread_local", "__thread", "_Atomic", "__int128",
     };
 
     for (int i = 0; i < sizeof(kw) / sizeof(*kw); i++)
@@ -2836,25 +2859,28 @@ static Node *new_inc_dec(Node *node, Token *tok, int addend) {
 //              | "++"
 //              | "--"
 static Node *postfix(Token **rest, Token *tok) {
+  Node *node;
+
   if (equal(tok, "(") && is_typename(tok->next)) {
-    // Compound literal
+    // Compound literal. Like any postfix expression, it can be followed by
+    // postfix operators, e.g. `(char[]){1, 2}[i]`.
     Token *start = tok;
     Type *ty = typename(&tok, tok->next);
     tok = skip(tok, ")");
 
     if (scope->next == NULL) {
       Obj *var = new_anon_gvar(ty);
-      gvar_initializer(rest, tok, var);
-      return new_var_node(var, start);
+      gvar_initializer(&tok, tok, var);
+      node = new_var_node(var, start);
+    } else {
+      Obj *var = new_lvar("", ty);
+      Node *lhs = lvar_initializer(&tok, tok, var);
+      Node *rhs = new_var_node(var, start);
+      node = new_binary(ND_COMMA, lhs, rhs, start);
     }
-
-    Obj *var = new_lvar("", ty);
-    Node *lhs = lvar_initializer(rest, tok, var);
-    Node *rhs = new_var_node(var, tok);
-    return new_binary(ND_COMMA, lhs, rhs, start);
+  } else {
+    node = primary(&tok, tok);
   }
-
-  Node *node = primary(&tok, tok);
 
   for (;;) {
     if (equal(tok, "(")) {
@@ -3086,6 +3112,47 @@ static Node *primary(Token **rest, Token *tok) {
     if (is_flonum(ty))
       return new_num(1, start);
     return new_num(2, start);
+  }
+
+  // Variadic-argument builtins, used by include/stdarg.h with the LLVM
+  // backend. The va_list operand is passed as written; its value is the
+  // address of the va_list object (an array, a struct, or a pointer to one).
+  if (equal(tok, "__builtin_va_start") || equal(tok, "__builtin_va_end")) {
+    Node *node = new_node(equal(tok, "__builtin_va_start") ? ND_VA_START : ND_VA_END, tok);
+    tok = skip(tok->next, "(");
+    node->lhs = assign(&tok, tok);
+    add_type(node->lhs);
+    // The second argument of va_start (the last named parameter) is not
+    // needed.
+    if (node->kind == ND_VA_START && consume(&tok, tok, ","))
+      assign(&tok, tok);
+    *rest = skip(tok, ")");
+    node->ty = ty_void;
+    return node;
+  }
+
+  if (equal(tok, "__builtin_va_copy")) {
+    Node *node = new_node(ND_VA_COPY, tok);
+    tok = skip(tok->next, "(");
+    node->lhs = assign(&tok, tok);
+    tok = skip(tok, ",");
+    node->rhs = assign(&tok, tok);
+    add_type(node->lhs);
+    add_type(node->rhs);
+    *rest = skip(tok, ")");
+    node->ty = ty_void;
+    return node;
+  }
+
+  if (equal(tok, "__builtin_va_arg")) {
+    Node *node = new_node(ND_VA_ARG, tok);
+    tok = skip(tok->next, "(");
+    node->lhs = assign(&tok, tok);
+    add_type(node->lhs);
+    tok = skip(tok, ",");
+    node->ty = typename(&tok, tok);
+    *rest = skip(tok, ")");
+    return node;
   }
 
   if (equal(tok, "__builtin_compare_and_swap")) {

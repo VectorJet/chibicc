@@ -6,16 +6,17 @@
 // supported subset is reported as a diagnostic. Nothing is silently dropped or
 // approximated.
 //
-// Supported: integer and pointer scalars, fixed-size arrays, structs and unions
-// as locals, parameters and globals (including string literals and global
+// Supported: integer (up to __int128), floating-point (float, double and long
+// double) and pointer scalars, fixed-size arrays, structs and unions as
+// locals, parameters and globals (including string literals and global
 // initializers that hold addresses of other globals or functions); direct
-// calls; integer arithmetic, bitwise and comparison operators; pointer
-// arithmetic, pointer difference and comparison; integer/pointer casts;
-// short-circuit && and ||; ?:; casts between integer types and to/from bool;
-// assignment and compound assignment (chibicc desugars the latter through
-// ND_ADDR/ND_DEREF, which are handled here); if, for, while, do/while, switch
-// (including GNU case ranges), goto and labels, break, continue and return;
-// GNU statement expressions.
+// and indirect calls; variadic function definitions; integer and
+// floating-point arithmetic, bitwise and comparison operators; pointer
+// arithmetic, pointer difference and comparison; conversions between all
+// scalar types; short-circuit && and ||; ?:; assignment and compound
+// assignment (chibicc desugars the latter through ND_ADDR/ND_DEREF, which are
+// handled here); if, for, while, do/while, switch (including GNU case ranges),
+// goto and labels, break, continue and return; GNU statement expressions.
 //
 // Arrays, structs and unions are stored as byte arrays ([N x i8]); elements
 // and members are accessed through byte-offset GEPs, which is what the
@@ -25,9 +26,8 @@
 // and packed layouts), assignment, ?:, and by-value parameters, arguments and
 // return values following the x86-64 SysV and AAPCS64 calling conventions.
 //
-// Not supported yet (diagnosed): floating point (including structs with
-// floating-point members passed by value), VLAs, indirect calls, computed
-// goto, thread-local variables, and anything else not listed above.
+// Not supported yet (diagnosed): VLAs, alloca, atomics, computed goto,
+// thread-local variables, inline assembly, and anything else not listed above.
 
 #include "chibicc.h"
 
@@ -79,6 +79,7 @@ static LLVMValueRef var_addr(Obj *var, Token *tok);
 static LLVMValueRef get_global(Obj *var);
 static LLVMValueRef get_function(Obj *fn, Token *tok);
 static void gen_stmt(Node *node);
+static uint64_t read_le(char *p, int size);
 
 //
 // Diagnostics
@@ -122,7 +123,20 @@ static char *type_name(Type *ty) {
 static bool is_scalar(Type *ty) {
   // _Atomic objects need atomic loads, stores and memory ordering, which are not
   // implemented, so they are rejected wherever a scalar is required.
-  return !ty->is_atomic && (is_integer(ty) || ty->kind == TY_PTR);
+  return !ty->is_atomic && (is_integer(ty) || is_flonum(ty) || ty->kind == TY_PTR);
+}
+
+typedef enum {
+  ARCH_X86_64,
+  ARCH_AARCH64,
+} Arch;
+
+static Arch arch;
+
+// long double is IEEE binary128 on AAPCS64 and the x87 80-bit format on
+// x86-64 (stored in 16 bytes).
+static LLVMTypeRef ldouble_type(void) {
+  return arch == ARCH_AARCH64 ? LLVMFP128TypeInContext(ctx) : LLVMX86FP80TypeInContext(ctx);
 }
 
 // Returns the LLVM type of a scalar C type, or NULL if it is not a scalar we
@@ -130,13 +144,50 @@ static bool is_scalar(Type *ty) {
 static LLVMTypeRef scalar_type(Type *ty) {
   if (is_integer(ty))
     return LLVMIntTypeInContext(ctx, ty->size * 8);
+  if (ty->kind == TY_FLOAT)
+    return LLVMFloatTypeInContext(ctx);
+  if (ty->kind == TY_DOUBLE)
+    return LLVMDoubleTypeInContext(ctx);
+  if (ty->kind == TY_LDOUBLE)
+    return ldouble_type();
   if (ty->kind == TY_PTR)
     return LLVMPointerTypeInContext(ctx, 0);
   return NULL;
 }
 
+// Number of value bits of a floating-point type's memory image.
+static int fp_bits(Type *ty) {
+  if (ty->kind == TY_LDOUBLE)
+    return arch == ARCH_AARCH64 ? 128 : 80;
+  return ty->size * 8;
+}
+
+// A long double constant. The frontend computes long double values in the
+// format of the machine chibicc runs on; printing the value as a hex float and
+// letting LLVM parse it yields the target's format whatever that host is.
+static LLVMValueRef ldouble_const(long double v) {
+  char buf[64];
+  int n = snprintf(buf, sizeof(buf), "%La", v);
+  return LLVMConstRealOfStringAndSize(ldouble_type(), buf, n);
+}
+
+// A floating-point constant from its memory image (little-endian bytes).
+static LLVMValueRef fp_const_from_bytes(Type *ty, char *p) {
+  if (ty->kind == TY_LDOUBLE) {
+    long double v;
+    memcpy(&v, p, sizeof(v));
+    return ldouble_const(v);
+  }
+
+  // float and double: reinterpret the IEEE bits.
+  LLVMTypeRef ity = LLVMIntTypeInContext(ctx, ty->size * 8);
+  return LLVMConstBitCast(LLVMConstInt(ity, read_le(p, ty->size), false), scalar_type(ty));
+}
+
+// Arrays of unknown size (`extern int a[];`) are included; they only ever
+// denote storage defined elsewhere.
 static bool is_array(Type *ty) {
-  return ty->kind == TY_ARRAY && !ty->is_atomic && ty->size >= 0;
+  return ty->kind == TY_ARRAY && !ty->is_atomic;
 }
 
 static bool is_aggregate(Type *ty) {
@@ -171,7 +222,7 @@ static LLVMTypeRef ptr_type(void) {
 // arrays; their members are accessed through byte-offset GEPs.
 static LLVMTypeRef storage_type(Type *ty) {
   if (is_memory(ty))
-    return LLVMArrayType2(i8_type(), ty->size);
+    return LLVMArrayType2(i8_type(), ty->size > 0 ? ty->size : 0);
   return scalar_type(ty);
 }
 
@@ -180,15 +231,7 @@ static LLVMTypeRef storage_type(Type *ty) {
 //
 // LLVM leaves the C ABI of aggregates to the frontend: structs and unions must
 // be lowered to the IR types the target's calling convention lowering expects,
-// as clang does. Implemented for x86-64 SysV and AAPCS64, for aggregates
-// without floating-point members (floating point is not supported yet).
-
-typedef enum {
-  ARCH_X86_64,
-  ARCH_AARCH64,
-} Arch;
-
-static Arch arch;
+// as clang does. Implemented for x86-64 SysV and AAPCS64.
 
 typedef enum {
   PASS_DIRECT, // scalar, passed as its own LLVM type
@@ -218,18 +261,6 @@ static int max_int(int a, int b) {
   return a > b ? a : b;
 }
 
-static bool has_flonum(Type *ty) {
-  if (is_flonum(ty))
-    return true;
-  if (ty->kind == TY_ARRAY)
-    return has_flonum(ty->base);
-  if (ty->kind == TY_STRUCT || ty->kind == TY_UNION)
-    for (Member *m = ty->members; m; m = m->next)
-      if (has_flonum(m->ty))
-        return true;
-  return false;
-}
-
 // x86-64 SysV classifies aggregates with misaligned members (from
 // __attribute__((packed))) as MEMORY.
 static bool has_unaligned_member(Type *ty) {
@@ -244,11 +275,77 @@ static bool has_unaligned_member(Type *ty) {
 }
 
 static void check_aggregate_abi(Type *ty, Token *tok) {
-  if (has_flonum(ty))
-    unsupported(tok, format("%s with floating-point members passed or returned by value",
-                            type_name(ty)));
   if (ty->size == 0)
     unsupported(tok, format("empty %s passed or returned by value", type_name(ty)));
+}
+
+// AAPCS64 homogeneous floating-point aggregate: all leaf members have the same
+// floating-point type and there are 1 to 4 of them. Returns that type and
+// sets *count, or returns NULL.
+static Type *hfa_leaf(Type *ty, Type *base) {
+  if (is_flonum(ty))
+    return (!base || base->kind == ty->kind) ? ty : NULL;
+  if (ty->kind == TY_ARRAY)
+    return ty->array_len > 0 ? hfa_leaf(ty->base, base) : NULL;
+  if (ty->kind != TY_STRUCT && ty->kind != TY_UNION)
+    return NULL;
+  for (Member *m = ty->members; m; m = m->next) {
+    if (m->is_bitfield)
+      return NULL;
+    base = hfa_leaf(m->ty, base);
+    if (!base)
+      return NULL;
+  }
+  return base;
+}
+
+static Type *hfa_base(Type *ty, int *count) {
+  if (!is_aggregate(ty) || ty->size == 0)
+    return NULL;
+  Type *base = hfa_leaf(ty, NULL);
+  if (!base || ty->size % base->size)
+    return NULL;
+  *count = ty->size / base->size;
+  return *count <= 4 ? base : NULL;
+}
+
+// x86-64 SysV classes of an eightbyte.
+typedef enum {
+  CLS_NONE,
+  CLS_INT,
+  CLS_SSE,
+  CLS_MEM,
+} X86Class;
+
+static X86Class merge_class(X86Class a, X86Class b) {
+  if (a == b || b == CLS_NONE)
+    return a;
+  if (a == CLS_NONE)
+    return b;
+  if (a == CLS_MEM || b == CLS_MEM)
+    return CLS_MEM;
+  return CLS_INT; // INTEGER and SSE merge to INTEGER
+}
+
+// Class of the leaf members of `ty` (at `base`) overlapping [lo, hi).
+static X86Class classify_x86(Type *ty, int base, int lo, int hi) {
+  if (ty->kind == TY_ARRAY) {
+    X86Class c = CLS_NONE;
+    for (int i = 0; i < ty->array_len; i++)
+      c = merge_class(c, classify_x86(ty->base, base + i * ty->base->size, lo, hi));
+    return c;
+  }
+  if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
+    X86Class c = CLS_NONE;
+    for (Member *m = ty->members; m; m = m->next)
+      c = merge_class(c, classify_x86(m->ty, base + m->offset, lo, hi));
+    return c;
+  }
+  if (!(base < hi && lo < base + ty->size))
+    return CLS_NONE;
+  if (ty->kind == TY_LDOUBLE)
+    return CLS_MEM; // X87 class: passed in memory
+  return is_flonum(ty) ? CLS_SSE : CLS_INT;
 }
 
 // AAPCS64 passes arguments according to their natural alignment: the largest
@@ -265,49 +362,82 @@ static int natural_align(Type *ty) {
   return align;
 }
 
-// True if any member of `ty` (at `base` within the outermost object) overlaps
-// the byte range [lo, hi). x86-64 SysV does not pass an eightbyte that holds
-// only padding (class NO_CLASS).
-static bool has_data_in(Type *ty, int base, int lo, int hi) {
-  if (ty->kind == TY_ARRAY) {
-    for (int i = 0; i < ty->array_len; i++)
-      if (has_data_in(ty->base, base + i * ty->base->size, lo, hi))
-        return true;
-    return false;
-  }
-  if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
-    for (Member *m = ty->members; m; m = m->next)
-      if (has_data_in(m->ty, base + m->offset, lo, hi))
-        return true;
-    return false;
-  }
-  return base < hi && lo < base + ty->size;
-}
-
-// Integer type(s) holding the memory image of an aggregate of at most 16
-// bytes in general-purpose registers. On AAPCS64 a 16-byte-aligned aggregate
-// is passed as i128, which starts at an even-numbered register.
-static LLVMTypeRef int_regs_type(Type *ty, int align) {
-  if (arch == ARCH_AARCH64 && align >= 16)
+// AAPCS64: integer type(s) holding the memory image of an aggregate of at
+// most 16 bytes in general-purpose registers. A 16-byte-aligned aggregate is
+// passed as i128, which starts at an even-numbered register.
+static LLVMTypeRef aarch64_int_regs_type(Type *ty, int align) {
+  if (align >= 16)
     return LLVMInt128TypeInContext(ctx);
-  if (ty->size <= 8 || (arch == ARCH_X86_64 && !has_data_in(ty, 0, 8, 16)))
+  if (ty->size <= 8)
     return i64_type();
-  if (arch == ARCH_AARCH64)
-    return LLVMArrayType2(i64_type(), 2);
-  LLVMTypeRef pair[2] = {i64_type(), i64_type()};
-  return LLVMStructTypeInContext(ctx, pair, 2, false);
+  return LLVMArrayType2(i64_type(), 2);
 }
 
-// `gprs` counts the x86-64 integer argument registers left. An aggregate that
-// needs more registers than are left goes entirely to memory, which the
-// frontend has to decide because LLVM would split it between registers and the
-// stack.
-static ArgABI classify_arg(Type *ty, int *gprs, Token *tok) {
+// AAPCS64: the coerced type of an HFA, [n x T], passed in n vector registers.
+static LLVMTypeRef hfa_type(Type *base, int count) {
+  return LLVMArrayType2(scalar_type(base), count);
+}
+
+// x86-64: the classes of the (at most two) eightbytes of an aggregate of at
+// most 16 bytes. Returns false if it is passed in memory.
+static bool x86_eightbyte_classes(Type *ty, X86Class cls[2]) {
+  if (ty->size > 16 || has_unaligned_member(ty))
+    return false;
+  cls[0] = classify_x86(ty, 0, 0, 8);
+  cls[1] = ty->size > 8 ? classify_x86(ty, 0, 8, 16) : CLS_NONE;
+  if (cls[0] == CLS_MEM || cls[1] == CLS_MEM)
+    return false;
+  if (cls[0] == CLS_NONE)
+    cls[0] = CLS_INT; // leading padding; pass the eightbyte anyway
+  return true;
+}
+
+// x86-64: the coerced type of an aggregate passed in registers. Each eightbyte
+// is an i64 (INTEGER) or a double (SSE); a double carries any SSE eightbyte,
+// including one holding two floats, bit for bit.
+static LLVMTypeRef x86_coerced_type(X86Class cls[2]) {
+  LLVMTypeRef t[2];
+  for (int i = 0; i < 2; i++)
+    t[i] = cls[i] == CLS_SSE ? LLVMDoubleTypeInContext(ctx) : i64_type();
+  if (cls[1] == CLS_NONE)
+    return t[0];
+  return LLVMStructTypeInContext(ctx, t, 2, false);
+}
+
+// x86-64 argument registers left: 6 general-purpose and 8 SSE.
+typedef struct {
+  int gprs;
+  int fprs;
+} RegsLeft;
+
+// Parameter types are copies made when the function type was parsed. If a
+// struct or union was still incomplete then, the copy stays incomplete while
+// the original (`origin`) is completed in place by the later definition.
+static Type *completed(Type *ty) {
+  while (ty->size < 0 && ty->origin)
+    ty = ty->origin;
+  return ty;
+}
+
+// An x86-64 aggregate that needs more registers of either kind than are left
+// goes entirely to memory, which the frontend has to decide because LLVM would
+// split it between registers and the stack.
+static ArgABI classify_arg(Type *ty, RegsLeft *regs, Token *tok) {
+  ty = completed(ty);
   ArgABI a = {PASS_DIRECT, NULL, ty};
   if (is_scalar(ty)) {
     a.ty = scalar_type(ty);
-    if (*gprs > 0)
-      (*gprs)--;
+    if (is_flonum(ty)) {
+      if (ty->kind != TY_LDOUBLE && regs->fprs > 0)
+        regs->fprs--;
+    } else if (ty->size > 8) {
+      // __int128 takes a register pair; LLVM spills it whole when one register
+      // is left.
+      if (regs->gprs >= 2)
+        regs->gprs -= 2;
+    } else if (regs->gprs > 0) {
+      regs->gprs--;
+    }
     return a;
   }
   if (!is_aggregate(ty))
@@ -315,32 +445,68 @@ static ArgABI classify_arg(Type *ty, int *gprs, Token *tok) {
   check_aggregate_abi(ty, tok);
 
   if (arch == ARCH_AARCH64) {
+    int n;
+    Type *base = hfa_base(ty, &n);
+    if (base) {
+      a.kind = PASS_COERCE;
+      a.ty = hfa_type(base, n);
+      return a;
+    }
     if (ty->size > 16) {
       a.kind = PASS_BYREF;
       a.ty = ptr_type();
       return a;
     }
     a.kind = PASS_COERCE;
-    a.ty = int_regs_type(ty, natural_align(ty));
+    a.ty = aarch64_int_regs_type(ty, natural_align(ty));
     return a;
   }
 
-  int need = (ty->size > 8 && has_data_in(ty, 0, 8, 16)) ? 2 : 1;
-  if (ty->size > 16 || has_unaligned_member(ty) || need > *gprs) {
-    a.kind = PASS_BYVAL;
-    a.ty = ptr_type();
-    return a;
+  X86Class cls[2];
+  if (x86_eightbyte_classes(ty, cls)) {
+    int need_gp = (cls[0] == CLS_INT) + (cls[1] == CLS_INT);
+    int need_fp = (cls[0] == CLS_SSE) + (cls[1] == CLS_SSE);
+    if (need_gp <= regs->gprs && need_fp <= regs->fprs) {
+      regs->gprs -= need_gp;
+      regs->fprs -= need_fp;
+      a.kind = PASS_COERCE;
+      a.ty = x86_coerced_type(cls);
+      return a;
+    }
   }
-  *gprs -= need;
-  a.kind = PASS_COERCE;
-  a.ty = int_regs_type(ty, ty->align);
+  a.kind = PASS_BYVAL;
+  a.ty = ptr_type();
   return a;
+}
+
+// How an aggregate is returned: NULL for memory (sret), else the coerced type.
+static LLVMTypeRef aggregate_return_type(Type *ty) {
+  if (arch == ARCH_AARCH64) {
+    int n;
+    Type *base = hfa_base(ty, &n);
+    if (base)
+      return hfa_type(base, n);
+    if (ty->size > 16)
+      return NULL;
+    return aarch64_int_regs_type(ty, ty->align);
+  }
+  // An aggregate holding just a long double has classes X87, X87UP: returned
+  // in %st0 (as an argument it goes to memory).
+  int n;
+  Type *base = hfa_base(ty, &n);
+  if (base && base->kind == TY_LDOUBLE && n == 1)
+    return ldouble_type();
+
+  X86Class cls[2];
+  if (!x86_eightbyte_classes(ty, cls))
+    return NULL;
+  return x86_coerced_type(cls);
 }
 
 static FuncABI *func_abi(Type *fty, Node *extra_args, Token *tok) {
   FuncABI *abi = calloc(1, sizeof(FuncABI));
-  int gprs = 6;
-  Type *rt = fty->return_ty;
+  RegsLeft regs = {6, 8};
+  Type *rt = completed(fty->return_ty);
   LLVMTypeRef ret = LLVMVoidTypeInContext(ctx);
 
   if (rt->kind == TY_VOID) {
@@ -350,14 +516,14 @@ static FuncABI *func_abi(Type *fty, Node *extra_args, Token *tok) {
     ret = abi->ret.ty;
   } else if (is_aggregate(rt)) {
     check_aggregate_abi(rt, tok);
-    bool memory = rt->size > 16 || (arch == ARCH_X86_64 && has_unaligned_member(rt));
-    if (memory) {
+    LLVMTypeRef coerced = aggregate_return_type(rt);
+    if (!coerced) {
       abi->sret = true;
       abi->ret.cty = rt;
       if (arch == ARCH_X86_64)
-        gprs--; // the hidden pointer takes %rdi; AAPCS64 uses x8
+        regs.gprs--; // the hidden pointer takes %rdi; AAPCS64 uses x8
     } else {
-      abi->ret = (ArgABI){PASS_COERCE, int_regs_type(rt, rt->align), rt};
+      abi->ret = (ArgABI){PASS_COERCE, coerced, rt};
       ret = abi->ret.ty;
     }
   } else {
@@ -374,12 +540,16 @@ static FuncABI *func_abi(Type *fty, Node *extra_args, Token *tok) {
   abi->args = calloc(n ? n : 1, sizeof(ArgABI));
   int i = 0;
   for (Type *p = fty->params; p; p = p->next)
-    abi->args[i++] = classify_arg(p, &gprs, tok);
+    abi->args[i++] = classify_arg(p, &regs, tok);
   for (Node *a = extra_args; a; a = a->next) {
-    // Arrays among variadic arguments are not converted by the frontend; they
-    // are passed as the decayed pointer.
-    Type *ty = is_array(a->ty) ? pointer_to(a->ty->base) : a->ty;
-    abi->args[i++] = classify_arg(ty, &gprs, a->tok);
+    // Arrays and functions among variadic arguments are not converted by the
+    // frontend; they are passed as the decayed pointer.
+    Type *ty = a->ty;
+    if (is_array(ty))
+      ty = pointer_to(ty->base);
+    else if (ty->kind == TY_FUNC)
+      ty = pointer_to(ty);
+    abi->args[i++] = classify_arg(ty, &regs, a->tok);
   }
 
   LLVMTypeRef *params = calloc(n + 1, sizeof(LLVMTypeRef));
@@ -429,9 +599,16 @@ static void add_abi_attrs(FuncABI *abi, LLVMValueRef fn, LLVMValueRef call) {
   for (int i = 0; i < abi->nargs; i++) {
     ArgABI *a = &abi->args[i];
     int idx = abi_param_index(abi, i) + 1;
+    int hfa_n;
+    Type *hfa;
     if (a->kind == PASS_BYVAL) {
       ADD_ATTR(idx, type_attr("byval", storage_type(a->cty)));
       ADD_ATTR(idx, enum_attr("align", max_int(8, a->cty->align)));
+    } else if (arch == ARCH_AARCH64 && a->kind == PASS_COERCE &&
+               (hfa = hfa_base(a->cty, &hfa_n))) {
+      // An HFA that no longer fits in vector registers goes to the stack with
+      // at least 8-byte alignment (as clang specifies), not its element's.
+      ADD_ATTR(idx, enum_attr("alignstack", max_int(8, hfa->align)));
     } else if (a->kind == PASS_DIRECT && arch == ARCH_X86_64 && is_integer(a->cty) &&
                a->cty->size < 4) {
       ADD_ATTR(idx, enum_attr(a->cty->is_unsigned ? "zeroext" : "signext", 0));
@@ -513,6 +690,9 @@ static LLVMValueRef plain_initializer(Obj *var, LLVMTypeRef ty) {
     return LLVMConstNull(ty);
   if (is_memory(var->ty))
     return bytes_const(var->init_data, var->ty->size);
+
+  if (is_flonum(var->ty))
+    return fp_const_from_bytes(var->ty, var->init_data);
 
   uint64_t v = read_le(var->init_data, var->ty->size);
   if (var->ty->kind == TY_PTR)
@@ -796,9 +976,13 @@ static LLVMValueRef load_coerced(LLVMTypeRef ty, LLVMValueRef src, Type *cty) {
 
 // Truth value (i1) of a scalar.
 static LLVMValueRef to_bool(LLVMValueRef v) {
-  if (LLVMGetTypeKind(LLVMTypeOf(v)) == LLVMPointerTypeKind)
+  LLVMTypeRef ty = LLVMTypeOf(v);
+  if (LLVMGetTypeKind(ty) == LLVMPointerTypeKind)
     return LLVMBuildIsNotNull(bld, v, "");
-  return LLVMBuildICmp(bld, LLVMIntNE, v, LLVMConstNull(LLVMTypeOf(v)), "");
+  if (LLVMGetTypeKind(ty) != LLVMIntegerTypeKind)
+    // Floating point: true unless equal to zero (NaN is true).
+    return LLVMBuildFCmp(bld, LLVMRealUNE, v, LLVMConstNull(ty), "");
+  return LLVMBuildICmp(bld, LLVMIntNE, v, LLVMConstNull(ty), "");
 }
 
 static LLVMValueRef int_coerce(LLVMValueRef v, LLVMTypeRef want, bool src_unsigned) {
@@ -815,8 +999,9 @@ static LLVMValueRef int_coerce(LLVMValueRef v, LLVMTypeRef want, bool src_unsign
 static LLVMValueRef convert(LLVMValueRef v, Type *to, Type *from, Token *tok) {
   if (!v)
     unsupported(tok, "use of a void value");
-  // An array value is already the address of its first element.
-  if (is_array(from) && to->kind == TY_PTR)
+  // An array value is already the address of its first element, and a
+  // function designator's value is the function's address.
+  if ((is_array(from) || from->kind == TY_FUNC) && to->kind == TY_PTR)
     return v;
   // Struct and union values are addresses. The frontend only converts between
   // compatible types (assignment to a union, ?: and return).
@@ -824,6 +1009,24 @@ static LLVMValueRef convert(LLVMValueRef v, Type *to, Type *from, Token *tok) {
     return v;
   if (!is_scalar(to) || !is_scalar(from))
     unsupported(tok, format("conversion from %s to %s", type_name(from), type_name(to)));
+
+  if (is_flonum(from) || is_flonum(to)) {
+    if (from->kind == TY_PTR || to->kind == TY_PTR)
+      unsupported(tok, "conversion between pointer and floating point");
+    if (to->kind == TY_BOOL)
+      return LLVMBuildZExt(bld, to_bool(v), scalar_type(to), "");
+    if (is_flonum(from) && is_flonum(to)) {
+      if (fp_bits(from) == fp_bits(to))
+        return v;
+      return fp_bits(from) < fp_bits(to) ? LLVMBuildFPExt(bld, v, scalar_type(to), "")
+                                         : LLVMBuildFPTrunc(bld, v, scalar_type(to), "");
+    }
+    if (is_flonum(to))
+      return from->is_unsigned ? LLVMBuildUIToFP(bld, v, scalar_type(to), "")
+                               : LLVMBuildSIToFP(bld, v, scalar_type(to), "");
+    return to->is_unsigned ? LLVMBuildFPToUI(bld, v, scalar_type(to), "")
+                           : LLVMBuildFPToSI(bld, v, scalar_type(to), "");
+  }
 
   if (to->kind == TY_PTR) {
     if (from->kind == TY_PTR)
@@ -895,9 +1098,25 @@ static LLVMValueRef gen_ptr_arith(Node *node) {
   return LLVMBuildGEP2(bld, i8_type(), base, &off, 1, "");
 }
 
+// The usual arithmetic conversions give both operands the result type.
+static LLVMValueRef gen_fp_arith(Node *node) {
+  LLVMValueRef l = gen_value(node->lhs);
+  LLVMValueRef r = gen_value(node->rhs);
+  switch (node->kind) {
+  case ND_ADD: return LLVMBuildFAdd(bld, l, r, "");
+  case ND_SUB: return LLVMBuildFSub(bld, l, r, "");
+  case ND_MUL: return LLVMBuildFMul(bld, l, r, "");
+  case ND_DIV: return LLVMBuildFDiv(bld, l, r, "");
+  default:
+    unsupported(node->tok, "floating-point operator");
+  }
+}
+
 static LLVMValueRef gen_arith(Node *node) {
   if (is_address(node->ty) || is_address(node->lhs->ty))
     return gen_ptr_arith(node);
+  if (is_flonum(node->ty) && is_flonum(node->lhs->ty) && is_flonum(node->rhs->ty))
+    return gen_fp_arith(node);
   if (!is_integer(node->ty) || !is_integer(node->lhs->ty) || !is_integer(node->rhs->ty))
     unsupported(node->tok, format("arithmetic on %s", type_name(node->ty)));
 
@@ -933,6 +1152,19 @@ static LLVMValueRef gen_compare(Node *node) {
 
   LLVMValueRef l = gen_value(node->lhs);
   LLVMValueRef r = gen_value(node->rhs);
+
+  if (is_flonum(node->lhs->ty)) {
+    // Ordered comparisons are false for NaN; != is true.
+    LLVMRealPredicate fpred;
+    switch (node->kind) {
+    case ND_EQ: fpred = LLVMRealOEQ; break;
+    case ND_NE: fpred = LLVMRealUNE; break;
+    case ND_LT: fpred = LLVMRealOLT; break;
+    default:    fpred = LLVMRealOLE; break;
+    }
+    return LLVMBuildZExt(bld, LLVMBuildFCmp(bld, fpred, l, r, ""), scalar_type(node->ty), "");
+  }
+
   if (!ptrs)
     r = int_coerce(r, LLVMTypeOf(l), node->rhs->ty->is_unsigned);
 
@@ -1014,10 +1246,13 @@ static LLVMValueRef gen_cond_expr(Node *node) {
 }
 
 static LLVMValueRef gen_call(Node *node) {
-  if (node->lhs->kind != ND_VAR || node->lhs->var->ty->kind != TY_FUNC)
-    unsupported(node->tok, "indirect call");
-
-  LLVMValueRef fn = get_function(node->lhs->var, node->tok);
+  // A direct call names the function; anything else is a call through a
+  // function pointer, whose value is the callee's address.
+  LLVMValueRef fn;
+  if (node->lhs->kind == ND_VAR && node->lhs->var->ty->kind == TY_FUNC)
+    fn = get_function(node->lhs->var, node->tok);
+  else
+    fn = gen_value(node->lhs);
 
   // Arguments past the declared parameters are variadic (or unprototyped).
   Node *extra = node->args;
@@ -1074,6 +1309,203 @@ static LLVMValueRef gen_call(Node *node) {
     return ret_buf;
   }
   return r;
+}
+
+//
+// Variadic arguments
+//
+// va_start, va_end and va_copy are LLVM intrinsics. va_arg is expanded here
+// following each ABI's algorithm (as clang does): LLVM's own va_arg
+// instruction does not implement the AAPCS64 va_list.
+
+static LLVMValueRef call_intrinsic(char *name, LLVMTypeRef *overloads, int noverloads,
+                                   LLVMValueRef *args, int nargs) {
+  unsigned id = LLVMLookupIntrinsicID(name, strlen(name));
+  if (!LLVMIntrinsicIsOverloaded(id))
+    noverloads = 0;
+  LLVMValueRef fn = LLVMGetIntrinsicDeclaration(mod, id, overloads, noverloads);
+  return LLVMBuildCall2(bld, LLVMGlobalGetValueType(fn), fn, args, nargs, "");
+}
+
+static LLVMValueRef byte_gep(LLVMValueRef base, LLVMValueRef off) {
+  return LLVMBuildGEP2(bld, i8_type(), base, &off, 1, "");
+}
+
+static LLVMValueRef field_addr(LLVMValueRef base, int off) {
+  return off ? byte_gep(base, LLVMConstInt(i64_type(), off, false)) : base;
+}
+
+static LLVMValueRef i32_const(long v) {
+  return LLVMConstInt(LLVMInt32TypeInContext(ctx), v, true);
+}
+
+static LLVMValueRef align_ptr_up(LLVMValueRef p, int align) {
+  LLVMValueRef v = LLVMBuildPtrToInt(bld, p, i64_type(), "");
+  v = LLVMBuildAdd(bld, v, LLVMConstInt(i64_type(), align - 1, false), "");
+  v = LLVMBuildAnd(bld, v, LLVMConstInt(i64_type(), -(long)align, true), "");
+  return LLVMBuildIntToPtr(bld, v, ptr_type(), "");
+}
+
+// Takes `size` bytes (rounded up to 8) from the overflow area whose pointer is
+// stored at `slot`, first aligning it to `align`.
+static LLVMValueRef va_take_stack(LLVMValueRef slot, int size, int align) {
+  LLVMValueRef p = load(ptr_type(), slot, 8);
+  if (align > 8)
+    p = align_ptr_up(p, align);
+  LLVMValueRef next = byte_gep(p, LLVMConstInt(i64_type(), (size + 7) / 8 * 8, false));
+  store(next, slot, 8);
+  return p;
+}
+
+static LLVMValueRef phi2(LLVMTypeRef ty, LLVMValueRef a, LLVMBasicBlockRef ab,
+                         LLVMValueRef b, LLVMBasicBlockRef bb) {
+  LLVMValueRef phi = LLVMBuildPhi(bld, ty, "");
+  LLVMValueRef vals[2] = {a, b};
+  LLVMBasicBlockRef bbs[2] = {ab, bb};
+  LLVMAddIncoming(phi, vals, bbs, 2);
+  return phi;
+}
+
+// AAPCS64 va_list: { void *__stack; void *__gr_top; void *__vr_top;
+// int __gr_offs; int __vr_offs; }. The offsets count up from minus the size
+// of the register save area to 0; a non-negative offset means the registers
+// are used up and arguments come from the stack.
+static LLVMValueRef va_arg_aarch64(LLVMValueRef ap, Type *ty) {
+  int hfa_n = 0;
+  Type *hfa = hfa_base(ty, &hfa_n);
+  // Other aggregates larger than 16 bytes are passed by reference.
+  bool indirect = !hfa && is_aggregate(ty) && ty->size > 16;
+  int size = indirect ? 8 : ty->size;
+  int align = indirect ? 8 : natural_align(ty);
+  bool fp = hfa || (!indirect && is_flonum(ty));
+  int offs_field = fp ? 28 : 24;
+  int top_field = fp ? 16 : 8;
+  // Each floating-point value (or HFA element) takes a 16-byte vector slot.
+  int reg_bytes = fp ? 16 * (hfa ? hfa_n : 1) : (size + 7) / 8 * 8;
+
+  LLVMBasicBlockRef maybe_reg = new_block("va.maybe_reg");
+  LLVMBasicBlockRef in_reg = new_block("va.in_reg");
+  LLVMBasicBlockRef on_stack = new_block("va.on_stack");
+  LLVMBasicBlockRef end = new_block("va.end");
+
+  LLVMValueRef offs_addr = field_addr(ap, offs_field);
+  LLVMValueRef offs = load(LLVMInt32TypeInContext(ctx), offs_addr, 4);
+  LLVMBuildCondBr(bld, LLVMBuildICmp(bld, LLVMIntSGE, offs, i32_const(0), ""), on_stack, maybe_reg);
+
+  position(maybe_reg);
+  // A 16-byte-aligned argument starts at an even register.
+  if (!fp && align >= 16)
+    offs = LLVMBuildAnd(bld, LLVMBuildAdd(bld, offs, i32_const(15), ""), i32_const(-16), "");
+  LLVMValueRef next = LLVMBuildAdd(bld, offs, i32_const(reg_bytes), "");
+  store(next, offs_addr, 4);
+  LLVMBuildCondBr(bld, LLVMBuildICmp(bld, LLVMIntSLE, next, i32_const(0), ""), in_reg, on_stack);
+
+  position(in_reg);
+  LLVMValueRef top = load(ptr_type(), field_addr(ap, top_field), 8);
+  LLVMValueRef reg_addr = byte_gep(top, LLVMBuildSExt(bld, offs, i64_type(), ""));
+  if (hfa) {
+    // Gather the elements from their vector slots into the aggregate's layout.
+    LLVMValueRef tmp = entry_alloca(storage_type(ty), 16);
+    for (int i = 0; i < hfa_n; i++)
+      copy_mem(field_addr(tmp, i * hfa->size), hfa->align, field_addr(reg_addr, 16 * i), 16,
+               hfa->size);
+    reg_addr = tmp;
+  }
+  LLVMBuildBr(bld, end);
+
+  position(on_stack);
+  LLVMValueRef stack_addr = va_take_stack(field_addr(ap, 0), size, align >= 16 ? 16 : 8);
+  LLVMBasicBlockRef on_stack_end = LLVMGetInsertBlock(bld);
+  LLVMBuildBr(bld, end);
+
+  position(end);
+  LLVMValueRef addr = phi2(ptr_type(), reg_addr, in_reg, stack_addr, on_stack_end);
+  return indirect ? load(ptr_type(), addr, 8) : addr;
+}
+
+// x86-64 SysV va_list element: { unsigned gp_offset; unsigned fp_offset;
+// void *overflow_arg_area; void *reg_save_area; }. The register save area
+// holds the 6 integer registers (48 bytes) followed by the 8 SSE registers
+// (16 bytes each, up to offset 176).
+static LLVMValueRef va_arg_x86_64(LLVMValueRef ap, Type *ty) {
+  LLVMValueRef overflow = field_addr(ap, 8);
+  X86Class cls[2] = {CLS_NONE, CLS_NONE};
+  if (is_scalar(ty)) {
+    if (ty->kind == TY_LDOUBLE)
+      return va_take_stack(overflow, ty->size, ty->align);
+    cls[0] = is_flonum(ty) ? CLS_SSE : CLS_INT;
+    if (ty->size > 8)
+      cls[1] = CLS_INT; // __int128
+  } else if (!x86_eightbyte_classes(ty, cls)) {
+    return va_take_stack(overflow, ty->size, ty->align);
+  }
+  int need_gp = (cls[0] == CLS_INT) + (cls[1] == CLS_INT);
+  int need_fp = (cls[0] == CLS_SSE) + (cls[1] == CLS_SSE);
+
+  LLVMBasicBlockRef in_reg = new_block("va.in_reg");
+  LLVMBasicBlockRef in_mem = new_block("va.in_mem");
+  LLVMBasicBlockRef end = new_block("va.end");
+
+  LLVMTypeRef i32 = LLVMInt32TypeInContext(ctx);
+  LLVMValueRef gp_addr = field_addr(ap, 0);
+  LLVMValueRef fp_addr = field_addr(ap, 4);
+  LLVMValueRef gp = load(i32, gp_addr, 4);
+  LLVMValueRef fp = load(i32, fp_addr, 4);
+  LLVMValueRef fits = LLVMConstInt(LLVMInt1TypeInContext(ctx), 1, false);
+  if (need_gp)
+    fits = LLVMBuildAnd(bld, fits, LLVMBuildICmp(bld, LLVMIntULE, gp, i32_const(48 - 8 * need_gp), ""), "");
+  if (need_fp)
+    fits = LLVMBuildAnd(bld, fits, LLVMBuildICmp(bld, LLVMIntULE, fp, i32_const(176 - 16 * need_fp), ""), "");
+  LLVMBuildCondBr(bld, fits, in_reg, in_mem);
+
+  position(in_reg);
+  LLVMValueRef save = load(ptr_type(), field_addr(ap, 16), 8);
+  LLVMValueRef gp_slot = byte_gep(save, LLVMBuildZExt(bld, gp, i64_type(), ""));
+  LLVMValueRef fp_slot = byte_gep(save, LLVMBuildZExt(bld, fp, i64_type(), ""));
+  LLVMValueRef reg_addr;
+  if (!need_fp) {
+    reg_addr = gp_slot; // integer eightbytes are contiguous
+  } else if (!need_gp && cls[1] == CLS_NONE) {
+    reg_addr = fp_slot;
+  } else {
+    // SSE eightbytes are 16 bytes apart, and a mixed aggregate draws from
+    // both areas: gather the eightbytes into a temporary.
+    reg_addr = entry_alloca(LLVMArrayType2(i8_type(), 16), 16);
+    int gi = 0, fi = 0;
+    for (int i = 0; i < 2 && cls[i] != CLS_NONE; i++) {
+      LLVMValueRef src = cls[i] == CLS_INT ? field_addr(gp_slot, 8 * gi++)
+                                           : field_addr(fp_slot, 16 * fi++);
+      copy_mem(field_addr(reg_addr, 8 * i), 8, src, 8, 8);
+    }
+  }
+  if (need_gp)
+    store(LLVMBuildAdd(bld, gp, i32_const(8 * need_gp), ""), gp_addr, 4);
+  if (need_fp)
+    store(LLVMBuildAdd(bld, fp, i32_const(16 * need_fp), ""), fp_addr, 4);
+  LLVMBuildBr(bld, end);
+
+  position(in_mem);
+  LLVMValueRef mem_addr = va_take_stack(overflow, ty->size, ty->align);
+  LLVMBasicBlockRef in_mem_end = LLVMGetInsertBlock(bld);
+  LLVMBuildBr(bld, end);
+
+  position(end);
+  return phi2(ptr_type(), reg_addr, in_reg, mem_addr, in_mem_end);
+}
+
+static LLVMValueRef gen_va_arg(Node *node) {
+  Type *ty = node->ty;
+  if (!is_scalar(ty) && !is_aggregate(ty))
+    unsupported(node->tok, format("va_arg of type %s", type_name(ty)));
+  if (is_aggregate(ty))
+    check_aggregate_abi(ty, node->tok);
+
+  LLVMValueRef ap = gen_value(node->lhs);
+  LLVMValueRef addr = arch == ARCH_AARCH64 ? va_arg_aarch64(ap, ty) : va_arg_x86_64(ap, ty);
+  // A struct or union value is its address.
+  if (is_aggregate(ty))
+    return addr;
+  return load(scalar_type(ty), addr, ty->align < 8 ? ty->align : 8);
 }
 
 static LLVMValueRef member_addr(Node *node) {
@@ -1165,13 +1597,18 @@ static LLVMValueRef gen_expr(Node *node) {
         unsupported(node->tok, "non-null pointer constant");
       return LLVMConstNull(scalar_type(node->ty));
     }
+    if (node->ty->kind == TY_LDOUBLE)
+      return ldouble_const(node->fval);
+    if (is_flonum(node->ty))
+      return LLVMConstReal(scalar_type(node->ty), (double)node->fval);
     if (!is_integer(node->ty))
       unsupported(node->tok, format("constant of type %s", type_name(node->ty)));
     return LLVMConstInt(scalar_type(node->ty), (unsigned long long)node->val, false);
 
   case ND_VAR:
+    // A function designator's value is the function's address.
     if (node->var->ty->kind == TY_FUNC)
-      unsupported(node->tok, "function used as a value");
+      return var_addr(node->var, node->tok);
     // The value of an array, struct or union is its address.
     if (is_memory(node->ty))
       return var_addr(node->var, node->tok);
@@ -1182,9 +1619,9 @@ static LLVMValueRef gen_expr(Node *node) {
   case ND_DEREF:
     if (!is_address(node->lhs->ty))
       unsupported(node->tok, "dereference of a non-pointer");
-    // Dereferencing a pointer to an array (e.g. a row of a 2D array), struct
-    // or union yields that object, whose value is its address.
-    if (is_memory(node->ty))
+    // Dereferencing a pointer to an array (e.g. a row of a 2D array), struct,
+    // union or function yields that object, whose value is its address.
+    if (is_memory(node->ty) || node->ty->kind == TY_FUNC)
       return gen_value(node->lhs);
     if (!is_scalar(node->ty))
       unsupported(node->tok, format("dereference of %s", type_name(node->ty)));
@@ -1246,6 +1683,8 @@ static LLVMValueRef gen_expr(Node *node) {
     return convert(gen_value(node->lhs), node->ty, node->lhs->ty, node->tok);
 
   case ND_NEG:
+    if (is_flonum(node->ty))
+      return LLVMBuildFNeg(bld, gen_value(node->lhs), "");
     return LLVMBuildNeg(bld, gen_int(node->lhs), "");
 
   case ND_BITNOT:
@@ -1282,6 +1721,24 @@ static LLVMValueRef gen_expr(Node *node) {
 
   case ND_FUNCALL:
     return gen_call(node);
+
+  case ND_VA_START:
+  case ND_VA_END: {
+    LLVMValueRef ap = gen_value(node->lhs);
+    LLVMTypeRef pty = ptr_type();
+    call_intrinsic(node->kind == ND_VA_START ? "llvm.va_start" : "llvm.va_end", &pty, 1, &ap, 1);
+    return NULL;
+  }
+
+  case ND_VA_COPY: {
+    LLVMValueRef args[2] = {gen_value(node->lhs), gen_value(node->rhs)};
+    LLVMTypeRef pty = ptr_type();
+    call_intrinsic("llvm.va_copy", &pty, 1, args, 2);
+    return NULL;
+  }
+
+  case ND_VA_ARG:
+    return gen_va_arg(node);
 
   case ND_STMT_EXPR:
     // [GNU] ({ ... }) has the value of its last statement, which the frontend
