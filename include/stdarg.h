@@ -1,6 +1,37 @@
 #ifndef __STDARG_H
 #define __STDARG_H
 
+#ifdef __chibicc_llvm__
+
+// With the LLVM backend, the va_list layout is the target ABI's and the
+// operations are builtins lowered by the backend.
+#ifdef __aarch64__
+typedef struct __va_list {
+  void *__stack;
+  void *__gr_top;
+  void *__vr_top;
+  int __gr_offs;
+  int __vr_offs;
+} va_list;
+#else
+typedef struct {
+  unsigned int gp_offset;
+  unsigned int fp_offset;
+  void *overflow_arg_area;
+  void *reg_save_area;
+} __va_elem;
+
+typedef __va_elem va_list[1];
+#endif
+
+#define va_start(ap, last) __builtin_va_start(ap, last)
+#define va_end(ap) __builtin_va_end(ap)
+#define va_arg(ap, ty) __builtin_va_arg(ap, ty)
+#define va_copy(dest, src) __builtin_va_copy(dest, src)
+#define __va_copy(dest, src) __builtin_va_copy(dest, src)
+
+#else
+
 typedef struct {
   unsigned int gp_offset;
   unsigned int fp_offset;
@@ -50,6 +81,8 @@ static void *__va_arg_fp(__va_elem *ap, int sz, int align) {
   })
 
 #define va_copy(dest, src) ((dest)[0] = (src)[0])
+
+#endif
 
 #define __GNUC_VA_LIST 1
 typedef va_list __gnuc_va_list;

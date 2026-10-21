@@ -167,7 +167,7 @@ static bool is_keyword(Token *tok) {
       "unsigned", "const", "volatile", "auto", "register", "restrict",
       "__restrict", "__restrict__", "_Noreturn", "float", "double",
       "typeof", "asm", "_Thread_local", "__thread", "_Atomic",
-      "__attribute__",
+      "__attribute__", "__int128",
     };
 
     for (int i = 0; i < sizeof(kw) / sizeof(*kw); i++)
@@ -585,7 +585,8 @@ Token *tokenize(File *file) {
     // Character literal
     if (*p == '\'') {
       cur = cur->next = read_char_literal(p, p, ty_int);
-      cur->val = (char)cur->val;
+      // A character literal has type int and the value of a plain char.
+      cur->val = ty_char->is_unsigned ? (unsigned char)cur->val : (signed char)cur->val;
       p += cur->len;
       continue;
     }

@@ -222,6 +222,10 @@ typedef enum {
   ND_ASM,       // "asm"
   ND_CAS,       // Atomic compare-and-swap
   ND_EXCH,      // Atomic exchange
+  ND_VA_START,  // __builtin_va_start (LLVM backend)
+  ND_VA_END,    // __builtin_va_end (LLVM backend)
+  ND_VA_COPY,   // __builtin_va_copy (LLVM backend)
+  ND_VA_ARG,    // __builtin_va_arg (LLVM backend)
 } NodeKind;
 
 // AST node type
@@ -305,6 +309,7 @@ typedef enum {
   TY_SHORT,
   TY_INT,
   TY_LONG,
+  TY_INT128, // [GNU] __int128
   TY_FLOAT,
   TY_DOUBLE,
   TY_LDOUBLE,
@@ -383,6 +388,9 @@ extern Type *ty_int;
 extern Type *ty_long;
 
 extern Type *ty_uchar;
+extern Type *ty_schar;
+extern Type *ty_int128;
+extern Type *ty_uint128;
 extern Type *ty_ushort;
 extern Type *ty_uint;
 extern Type *ty_ulong;
@@ -410,6 +418,14 @@ void add_type(Node *node);
 
 void codegen(Obj *prog, FILE *out);
 int align_to(int n, int align);
+
+//
+// llvm_backend.c (opt-in with --backend=llvm)
+//
+
+extern bool opt_backend_llvm;
+extern char *opt_target;
+void llvm_codegen(Obj *prog, char *output_path, char *target);
 
 //
 // unicode.c

@@ -25,6 +25,9 @@ static char *opt_MF;
 static char *opt_MT;
 static char *opt_o;
 
+bool opt_backend_llvm;
+char *opt_target;
+
 static StringArray ld_extra_args;
 static StringArray std_include_paths;
 
@@ -50,6 +53,31 @@ static bool take_arg(char *arg) {
   return false;
 }
 
+// Directory of the target's multiarch system headers. The legacy backend
+// always emits x86-64; the LLVM backend targets the host.
+static char *multiarch_include_dir = "/usr/include/x86_64-linux-gnu";
+
+// The LLVM backend compiles for the host, so the predefined macros, system
+// headers and the signedness of plain char must be the host's.
+static void configure_host_target(void) {
+  define_macro("__chibicc_llvm__", "1");
+  define_macro("__SIZEOF_INT128__", "16");
+  define_macro("__int128_t", "__int128");
+  define_macro("__uint128_t", "unsigned __int128");
+
+#if defined(__aarch64__)
+  undef_macro("__x86_64");
+  undef_macro("__x86_64__");
+  undef_macro("__amd64");
+  undef_macro("__amd64__");
+  define_macro("__aarch64__", "1");
+  define_macro("__ARM_64BIT_STATE", "1");
+  define_macro("__CHAR_UNSIGNED__", "1");
+  ty_char->is_unsigned = true;
+  multiarch_include_dir = "/usr/include/aarch64-linux-gnu";
+#endif
+}
+
 static void add_default_include_paths(char *argv0) {
   // We expect that chibicc-specific include files are installed
   // to ./include relative to argv[0].
@@ -57,7 +85,7 @@ static void add_default_include_paths(char *argv0) {
 
   // Add standard include paths.
   strarray_push(&include_paths, "/usr/local/include");
-  strarray_push(&include_paths, "/usr/include/x86_64-linux-gnu");
+  strarray_push(&include_paths, multiarch_include_dir);
   strarray_push(&include_paths, "/usr/include");
 
   // Keep a copy of the standard include paths for -MMD option.
@@ -315,6 +343,22 @@ static void parse_args(int argc, char **argv) {
       exit(0);
     }
 
+    if (!strncmp(argv[i], "--backend=", 10)) {
+      char *name = argv[i] + 10;
+      if (!strcmp(name, "llvm"))
+        opt_backend_llvm = true;
+      else if (!strcmp(name, "legacy"))
+        opt_backend_llvm = false;
+      else
+        error("unknown backend: %s (expected 'legacy' or 'llvm')", name);
+      continue;
+    }
+
+    if (!strncmp(argv[i], "--target=", 9)) {
+      opt_target = argv[i] + 9;
+      continue;
+    }
+
     // These options are ignored for now.
     if (!strncmp(argv[i], "-O", 2) ||
         !strncmp(argv[i], "-W", 2) ||
@@ -341,6 +385,18 @@ static void parse_args(int argc, char **argv) {
 
   if (input_paths.len == 0)
     error("no input files");
+
+  if (opt_target && !opt_backend_llvm)
+    error("--target requires --backend=llvm");
+
+  if (opt_backend_llvm) {
+#ifndef CHIBICC_LLVM
+    error("this chibicc was built without LLVM support (rebuild with WITH_LLVM=1)");
+#endif
+    if (opt_S)
+      error("-S is not supported with --backend=llvm");
+    configure_host_target();
+  }
 
   // -E implies that the input is the C macro language.
   if (opt_E)
@@ -552,6 +608,12 @@ static void cc1(void) {
 
   Obj *prog = parse(tok);
 
+  // The LLVM backend writes the object file itself.
+  if (opt_backend_llvm) {
+    llvm_codegen(prog, output_file, opt_target);
+    return;
+  }
+
   // Open a temporary output buffer.
   char *buf;
   size_t buflen;
@@ -679,6 +741,30 @@ static void run_linker(StringArray *inputs, char *output) {
   run_subprocess(arr.data);
 }
 
+#ifndef CHIBICC_CLANG
+#define CHIBICC_CLANG "clang-19"
+#endif
+
+// Links objects from the LLVM backend with the clang driver, which supplies the
+// C runtime startup files and libc for the host. Extra linker options pass
+// through as clang driver options; -Xlinker is not supported on this path.
+static void run_llvm_link(StringArray *inputs, char *output) {
+  StringArray arr = {};
+
+  strarray_push(&arr, CHIBICC_CLANG);
+  strarray_push(&arr, "-o");
+  strarray_push(&arr, output);
+
+  for (int i = 0; i < ld_extra_args.len; i++)
+    strarray_push(&arr, ld_extra_args.data[i]);
+
+  for (int i = 0; i < inputs->len; i++)
+    strarray_push(&arr, inputs->data[i]);
+
+  strarray_push(&arr, NULL);
+  run_subprocess(arr.data);
+}
+
 static FileType get_file_type(char *filename) {
   if (opt_x != FILE_NONE)
     return opt_x;
@@ -770,6 +856,11 @@ int main(int argc, char **argv) {
 
     // Compile and assemble
     if (opt_c) {
+      if (opt_backend_llvm) {
+        // The LLVM backend writes the object file directly.
+        run_cc1(argc, argv, input, output);
+        continue;
+      }
       char *tmp = create_tmpfile();
       run_cc1(argc, argv, input, tmp);
       assemble(tmp, output);
@@ -778,6 +869,11 @@ int main(int argc, char **argv) {
 
     // Compile, assemble and link
     char *tmp1 = create_tmpfile();
+    if (opt_backend_llvm) {
+      run_cc1(argc, argv, input, tmp1);
+      strarray_push(&ld_args, tmp1);
+      continue;
+    }
     char *tmp2 = create_tmpfile();
     run_cc1(argc, argv, input, tmp1);
     assemble(tmp1, tmp2);
@@ -785,7 +881,12 @@ int main(int argc, char **argv) {
     continue;
   }
 
-  if (ld_args.len > 0)
-    run_linker(&ld_args, opt_o ? opt_o : "a.out");
+  if (ld_args.len > 0) {
+    char *out = opt_o ? opt_o : "a.out";
+    if (opt_backend_llvm)
+      run_llvm_link(&ld_args, out);
+    else
+      run_linker(&ld_args, out);
+  }
   return 0;
 }

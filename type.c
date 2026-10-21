@@ -3,7 +3,10 @@
 Type *ty_void = &(Type){TY_VOID, 1, 1};
 Type *ty_bool = &(Type){TY_BOOL, 1, 1};
 
+// Plain char is signed on x86-64 and unsigned on AArch64 (see
+// configure_host_target in main.c), so `signed char` is a distinct type.
 Type *ty_char = &(Type){TY_CHAR, 1, 1};
+Type *ty_schar = &(Type){TY_CHAR, 1, 1};
 Type *ty_short = &(Type){TY_SHORT, 2, 2};
 Type *ty_int = &(Type){TY_INT, 4, 4};
 Type *ty_long = &(Type){TY_LONG, 8, 8};
@@ -12,6 +15,9 @@ Type *ty_uchar = &(Type){TY_CHAR, 1, 1, true};
 Type *ty_ushort = &(Type){TY_SHORT, 2, 2, true};
 Type *ty_uint = &(Type){TY_INT, 4, 4, true};
 Type *ty_ulong = &(Type){TY_LONG, 8, 8, true};
+
+Type *ty_int128 = &(Type){TY_INT128, 16, 16};
+Type *ty_uint128 = &(Type){TY_INT128, 16, 16, true};
 
 Type *ty_float = &(Type){TY_FLOAT, 4, 4};
 Type *ty_double = &(Type){TY_DOUBLE, 8, 8};
@@ -28,7 +34,7 @@ static Type *new_type(TypeKind kind, int size, int align) {
 bool is_integer(Type *ty) {
   TypeKind k = ty->kind;
   return k == TY_BOOL || k == TY_CHAR || k == TY_SHORT ||
-         k == TY_INT  || k == TY_LONG || k == TY_ENUM;
+         k == TY_INT  || k == TY_LONG || k == TY_ENUM || k == TY_INT128;
 }
 
 bool is_flonum(Type *ty) {
@@ -245,6 +251,11 @@ void add_type(Node *node) {
   case ND_COND:
     if (node->then->ty->kind == TY_VOID || node->els->ty->kind == TY_VOID) {
       node->ty = ty_void;
+    } else if (node->then->ty->kind == TY_STRUCT || node->then->ty->kind == TY_UNION) {
+      // Both operands have the same struct or union type. The usual
+      // arithmetic conversions do not apply (and would turn a struct smaller
+      // than int into an int).
+      node->ty = node->then->ty;
     } else {
       usual_arith_conv(&node->then, &node->els);
       node->ty = node->then->ty;
