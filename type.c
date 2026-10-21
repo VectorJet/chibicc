@@ -245,6 +245,11 @@ void add_type(Node *node) {
   case ND_COND:
     if (node->then->ty->kind == TY_VOID || node->els->ty->kind == TY_VOID) {
       node->ty = ty_void;
+    } else if (node->then->ty->kind == TY_STRUCT || node->then->ty->kind == TY_UNION) {
+      // Both operands have the same struct or union type. The usual
+      // arithmetic conversions do not apply (and would turn a struct smaller
+      // than int into an int).
+      node->ty = node->then->ty;
     } else {
       usual_arith_conv(&node->then, &node->els);
       node->ty = node->then->ty;

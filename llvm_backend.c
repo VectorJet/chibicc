@@ -6,23 +6,28 @@
 // supported subset is reported as a diagnostic. Nothing is silently dropped or
 // approximated.
 //
-// Supported: integer and pointer scalars and fixed-size arrays as locals,
-// parameters and globals (including string literals and global initializers
-// that hold addresses of other globals or functions); direct calls; integer
-// arithmetic, bitwise and comparison operators; pointer arithmetic, pointer
-// difference and comparison; integer/pointer casts; short-circuit && and ||;
-// ?:; casts between integer types and to/from bool; assignment and compound
-// assignment (chibicc desugars the latter through ND_ADDR/ND_DEREF, which are
-// handled here); if, for, while, do/while, switch (including GNU case ranges),
-// goto and labels, break, continue and return; GNU statement expressions.
+// Supported: integer and pointer scalars, fixed-size arrays, structs and unions
+// as locals, parameters and globals (including string literals and global
+// initializers that hold addresses of other globals or functions); direct
+// calls; integer arithmetic, bitwise and comparison operators; pointer
+// arithmetic, pointer difference and comparison; integer/pointer casts;
+// short-circuit && and ||; ?:; casts between integer types and to/from bool;
+// assignment and compound assignment (chibicc desugars the latter through
+// ND_ADDR/ND_DEREF, which are handled here); if, for, while, do/while, switch
+// (including GNU case ranges), goto and labels, break, continue and return;
+// GNU statement expressions.
 //
-// Arrays are stored as byte arrays ([N x i8]); elements are accessed through
-// byte-offset GEPs, which is what the frontend's pre-scaled pointer arithmetic
-// produces.
+// Arrays, structs and unions are stored as byte arrays ([N x i8]); elements
+// and members are accessed through byte-offset GEPs, which is what the
+// frontend's pre-scaled pointer arithmetic and member offsets produce.
 //
-// Not supported yet (diagnosed): floating point, structs and unions, VLAs,
-// indirect calls, computed goto, thread-local variables, and anything else not
-// listed above.
+// Structs and unions are supported as objects, members (including bitfields
+// and packed layouts), assignment, ?:, and by-value parameters, arguments and
+// return values following the x86-64 SysV and AAPCS64 calling conventions.
+//
+// Not supported yet (diagnosed): floating point (including structs with
+// floating-point members passed by value), VLAs, indirect calls, computed
+// goto, thread-local variables, and anything else not listed above.
 
 #include "chibicc.h"
 
@@ -134,9 +139,20 @@ static bool is_array(Type *ty) {
   return ty->kind == TY_ARRAY && !ty->is_atomic && ty->size >= 0;
 }
 
-// Types that can live in memory: scalars and fixed-size arrays.
+static bool is_aggregate(Type *ty) {
+  return (ty->kind == TY_STRUCT || ty->kind == TY_UNION) && !ty->is_atomic && ty->size >= 0;
+}
+
+// Arrays, structs and unions live in memory. Their value in an expression is
+// their address.
+static bool is_memory(Type *ty) {
+  return is_array(ty) || is_aggregate(ty);
+}
+
+// Types that can live in memory: scalars, fixed-size arrays, and complete
+// structs and unions.
 static bool is_storable(Type *ty) {
-  return is_scalar(ty) || is_array(ty);
+  return is_scalar(ty) || is_memory(ty);
 }
 
 static LLVMTypeRef i8_type(void) {
@@ -147,36 +163,281 @@ static LLVMTypeRef i64_type(void) {
   return LLVMInt64TypeInContext(ctx);
 }
 
-// LLVM type of an object's storage. Arrays are opaque byte arrays.
+static LLVMTypeRef ptr_type(void) {
+  return LLVMPointerTypeInContext(ctx, 0);
+}
+
+// LLVM type of an object's storage. Arrays, structs and unions are opaque byte
+// arrays; their members are accessed through byte-offset GEPs.
 static LLVMTypeRef storage_type(Type *ty) {
-  if (is_array(ty))
+  if (is_memory(ty))
     return LLVMArrayType2(i8_type(), ty->size);
   return scalar_type(ty);
 }
 
-static LLVMTypeRef function_type(Type *fty, Token *tok) {
+//
+// Calling convention
+//
+// LLVM leaves the C ABI of aggregates to the frontend: structs and unions must
+// be lowered to the IR types the target's calling convention lowering expects,
+// as clang does. Implemented for x86-64 SysV and AAPCS64, for aggregates
+// without floating-point members (floating point is not supported yet).
+
+typedef enum {
+  ARCH_X86_64,
+  ARCH_AARCH64,
+} Arch;
+
+static Arch arch;
+
+typedef enum {
+  PASS_DIRECT, // scalar, passed as its own LLVM type
+  PASS_COERCE, // aggregate, passed as `ty` loaded from its memory image
+  PASS_BYVAL,  // aggregate, pointer with the byval attribute (x86-64 memory class)
+  PASS_BYREF,  // aggregate, pointer to a caller-made copy (AAPCS64 > 16 bytes)
+} PassKind;
+
+typedef struct {
+  PassKind kind;
+  LLVMTypeRef ty; // LLVM parameter (or return) type
+  Type *cty;      // C type
+} ArgABI;
+
+typedef struct {
+  bool sret;      // aggregate returned through a hidden first pointer parameter
+  ArgABI ret;     // when !sret and the return type is not void
+  int nargs;
+  ArgABI *args;   // fixed parameters, then any variadic arguments of a call
+  LLVMTypeRef fty;
+} FuncABI;
+
+static FuncABI *cur_abi;      // ABI of the function being emitted
+static LLVMValueRef cur_sret; // its hidden return-buffer parameter, if any
+
+static int max_int(int a, int b) {
+  return a > b ? a : b;
+}
+
+static bool has_flonum(Type *ty) {
+  if (is_flonum(ty))
+    return true;
+  if (ty->kind == TY_ARRAY)
+    return has_flonum(ty->base);
+  if (ty->kind == TY_STRUCT || ty->kind == TY_UNION)
+    for (Member *m = ty->members; m; m = m->next)
+      if (has_flonum(m->ty))
+        return true;
+  return false;
+}
+
+// x86-64 SysV classifies aggregates with misaligned members (from
+// __attribute__((packed))) as MEMORY.
+static bool has_unaligned_member(Type *ty) {
+  if (ty->kind == TY_ARRAY)
+    return has_unaligned_member(ty->base);
+  if (ty->kind != TY_STRUCT && ty->kind != TY_UNION)
+    return false;
+  for (Member *m = ty->members; m; m = m->next)
+    if ((!m->is_bitfield && m->offset % m->ty->align) || has_unaligned_member(m->ty))
+      return true;
+  return false;
+}
+
+static void check_aggregate_abi(Type *ty, Token *tok) {
+  if (has_flonum(ty))
+    unsupported(tok, format("%s with floating-point members passed or returned by value",
+                            type_name(ty)));
+  if (ty->size == 0)
+    unsupported(tok, format("empty %s passed or returned by value", type_name(ty)));
+}
+
+// AAPCS64 passes arguments according to their natural alignment: the largest
+// member alignment, ignoring an aligned attribute on the aggregate type itself
+// (GCC and clang agree on this).
+static int natural_align(Type *ty) {
+  if (ty->kind == TY_ARRAY)
+    return natural_align(ty->base);
+  if (ty->kind != TY_STRUCT && ty->kind != TY_UNION)
+    return ty->align;
+  int align = 1;
+  for (Member *m = ty->members; m; m = m->next)
+    align = max_int(align, m->align);
+  return align;
+}
+
+// True if any member of `ty` (at `base` within the outermost object) overlaps
+// the byte range [lo, hi). x86-64 SysV does not pass an eightbyte that holds
+// only padding (class NO_CLASS).
+static bool has_data_in(Type *ty, int base, int lo, int hi) {
+  if (ty->kind == TY_ARRAY) {
+    for (int i = 0; i < ty->array_len; i++)
+      if (has_data_in(ty->base, base + i * ty->base->size, lo, hi))
+        return true;
+    return false;
+  }
+  if (ty->kind == TY_STRUCT || ty->kind == TY_UNION) {
+    for (Member *m = ty->members; m; m = m->next)
+      if (has_data_in(m->ty, base + m->offset, lo, hi))
+        return true;
+    return false;
+  }
+  return base < hi && lo < base + ty->size;
+}
+
+// Integer type(s) holding the memory image of an aggregate of at most 16
+// bytes in general-purpose registers. On AAPCS64 a 16-byte-aligned aggregate
+// is passed as i128, which starts at an even-numbered register.
+static LLVMTypeRef int_regs_type(Type *ty, int align) {
+  if (arch == ARCH_AARCH64 && align >= 16)
+    return LLVMInt128TypeInContext(ctx);
+  if (ty->size <= 8 || (arch == ARCH_X86_64 && !has_data_in(ty, 0, 8, 16)))
+    return i64_type();
+  if (arch == ARCH_AARCH64)
+    return LLVMArrayType2(i64_type(), 2);
+  LLVMTypeRef pair[2] = {i64_type(), i64_type()};
+  return LLVMStructTypeInContext(ctx, pair, 2, false);
+}
+
+// `gprs` counts the x86-64 integer argument registers left. An aggregate that
+// needs more registers than are left goes entirely to memory, which the
+// frontend has to decide because LLVM would split it between registers and the
+// stack.
+static ArgABI classify_arg(Type *ty, int *gprs, Token *tok) {
+  ArgABI a = {PASS_DIRECT, NULL, ty};
+  if (is_scalar(ty)) {
+    a.ty = scalar_type(ty);
+    if (*gprs > 0)
+      (*gprs)--;
+    return a;
+  }
+  if (!is_aggregate(ty))
+    unsupported(tok, format("parameter type %s", type_name(ty)));
+  check_aggregate_abi(ty, tok);
+
+  if (arch == ARCH_AARCH64) {
+    if (ty->size > 16) {
+      a.kind = PASS_BYREF;
+      a.ty = ptr_type();
+      return a;
+    }
+    a.kind = PASS_COERCE;
+    a.ty = int_regs_type(ty, natural_align(ty));
+    return a;
+  }
+
+  int need = (ty->size > 8 && has_data_in(ty, 0, 8, 16)) ? 2 : 1;
+  if (ty->size > 16 || has_unaligned_member(ty) || need > *gprs) {
+    a.kind = PASS_BYVAL;
+    a.ty = ptr_type();
+    return a;
+  }
+  *gprs -= need;
+  a.kind = PASS_COERCE;
+  a.ty = int_regs_type(ty, ty->align);
+  return a;
+}
+
+static FuncABI *func_abi(Type *fty, Node *extra_args, Token *tok) {
+  FuncABI *abi = calloc(1, sizeof(FuncABI));
+  int gprs = 6;
   Type *rt = fty->return_ty;
-  LLVMTypeRef ret;
+  LLVMTypeRef ret = LLVMVoidTypeInContext(ctx);
+
   if (rt->kind == TY_VOID) {
-    ret = LLVMVoidTypeInContext(ctx);
+    // nothing
+  } else if (is_scalar(rt)) {
+    abi->ret = (ArgABI){PASS_DIRECT, scalar_type(rt), rt};
+    ret = abi->ret.ty;
+  } else if (is_aggregate(rt)) {
+    check_aggregate_abi(rt, tok);
+    bool memory = rt->size > 16 || (arch == ARCH_X86_64 && has_unaligned_member(rt));
+    if (memory) {
+      abi->sret = true;
+      abi->ret.cty = rt;
+      if (arch == ARCH_X86_64)
+        gprs--; // the hidden pointer takes %rdi; AAPCS64 uses x8
+    } else {
+      abi->ret = (ArgABI){PASS_COERCE, int_regs_type(rt, rt->align), rt};
+      ret = abi->ret.ty;
+    }
   } else {
-    ret = is_scalar(rt) ? scalar_type(rt) : NULL;
-    if (!ret)
-      unsupported(tok, format("return type %s", type_name(rt)));
+    unsupported(tok, format("return type %s", type_name(rt)));
   }
 
   int n = 0;
   for (Type *p = fty->params; p; p = p->next)
     n++;
+  for (Node *a = extra_args; a; a = a->next)
+    n++;
 
-  LLVMTypeRef *params = calloc(n ? n : 1, sizeof(LLVMTypeRef));
+  abi->nargs = n;
+  abi->args = calloc(n ? n : 1, sizeof(ArgABI));
   int i = 0;
-  for (Type *p = fty->params; p; p = p->next, i++) {
-    params[i] = is_scalar(p) ? scalar_type(p) : NULL;
-    if (!params[i])
-      unsupported(tok, format("parameter type %s", type_name(p)));
+  for (Type *p = fty->params; p; p = p->next)
+    abi->args[i++] = classify_arg(p, &gprs, tok);
+  for (Node *a = extra_args; a; a = a->next) {
+    // Arrays among variadic arguments are not converted by the frontend; they
+    // are passed as the decayed pointer.
+    Type *ty = is_array(a->ty) ? pointer_to(a->ty->base) : a->ty;
+    abi->args[i++] = classify_arg(ty, &gprs, a->tok);
   }
-  return LLVMFunctionType(ret, params, n, fty->is_variadic);
+
+  LLVMTypeRef *params = calloc(n + 1, sizeof(LLVMTypeRef));
+  int np = 0;
+  if (abi->sret)
+    params[np++] = ptr_type();
+  int nfixed = n;
+  for (Node *a = extra_args; a; a = a->next)
+    nfixed--;
+  for (i = 0; i < nfixed; i++)
+    params[np++] = abi->args[i].ty;
+  abi->fty = LLVMFunctionType(ret, params, np, fty->is_variadic);
+  return abi;
+}
+
+// LLVM parameter index of C argument i.
+static int abi_param_index(FuncABI *abi, int i) {
+  return i + (abi->sret ? 1 : 0);
+}
+
+static LLVMAttributeRef enum_attr(char *name, uint64_t val) {
+  return LLVMCreateEnumAttribute(ctx, LLVMGetEnumAttributeKindForName(name, strlen(name)), val);
+}
+
+static LLVMAttributeRef type_attr(char *name, LLVMTypeRef ty) {
+  return LLVMCreateTypeAttribute(ctx, LLVMGetEnumAttributeKindForName(name, strlen(name)), ty);
+}
+
+// Attaches the ABI attributes to a function (call == NULL) or a call site.
+// LLVM attribute index 0 is the return value and i + 1 is parameter i.
+static void add_abi_attrs(FuncABI *abi, LLVMValueRef fn, LLVMValueRef call) {
+#define ADD_ATTR(idx, attr) \
+  (call ? LLVMAddCallSiteAttribute(call, idx, attr) : LLVMAddAttributeAtIndex(fn, idx, attr))
+
+  if (abi->sret) {
+    ADD_ATTR(1, type_attr("sret", storage_type(abi->ret.cty)));
+    ADD_ATTR(1, enum_attr("noalias", 0));
+  }
+
+  // x86-64 callers extend arguments and return values narrower than int to
+  // 32 bits, and clang-compiled code relies on it. AAPCS64 (non-Darwin) does
+  // not require it.
+  if (arch == ARCH_X86_64 && !abi->sret && abi->ret.cty &&
+      is_integer(abi->ret.cty) && abi->ret.cty->size < 4)
+    ADD_ATTR(0, enum_attr(abi->ret.cty->is_unsigned ? "zeroext" : "signext", 0));
+
+  for (int i = 0; i < abi->nargs; i++) {
+    ArgABI *a = &abi->args[i];
+    int idx = abi_param_index(abi, i) + 1;
+    if (a->kind == PASS_BYVAL) {
+      ADD_ATTR(idx, type_attr("byval", storage_type(a->cty)));
+      ADD_ATTR(idx, enum_attr("align", max_int(8, a->cty->align)));
+    } else if (a->kind == PASS_DIRECT && arch == ARCH_X86_64 && is_integer(a->cty) &&
+               a->cty->size < 4) {
+      ADD_ATTR(idx, enum_attr(a->cty->is_unsigned ? "zeroext" : "signext", 0));
+    }
+  }
+#undef ADD_ATTR
 }
 
 //
@@ -198,15 +459,21 @@ static char *resolve_target(char *requested) {
   char *host = strdup(msg);
   LLVMDisposeMessage(msg);
 
-  if (!requested || !strcmp(requested, host))
-    return host;
+  if (requested && strcmp(requested, host)) {
+    for (size_t i = 0; i < sizeof(known_targets) / sizeof(*known_targets); i++)
+      if (!strcmp(requested, known_targets[i]))
+        error("target '%s' is known but not enabled yet; this build targets only the host '%s'",
+              requested, host);
+    error("unknown target '%s' (host is '%s')", requested, host);
+  }
 
-  for (size_t i = 0; i < sizeof(known_targets) / sizeof(*known_targets); i++)
-    if (!strcmp(requested, known_targets[i]))
-      error("target '%s' is known but not enabled yet; this build targets only the host '%s'",
-            requested, host);
-
-  error("unknown target '%s' (host is '%s')", requested, host);
+  if (!strncmp(host, "x86_64-", 7))
+    arch = ARCH_X86_64;
+  else if (!strncmp(host, "aarch64-", 8))
+    arch = ARCH_AARCH64;
+  else
+    error("LLVM backend: host '%s' has no calling convention implementation", host);
+  return host;
 }
 
 //
@@ -244,7 +511,7 @@ static LLVMValueRef bytes_const(char *p, int len) {
 static LLVMValueRef plain_initializer(Obj *var, LLVMTypeRef ty) {
   if (!var->init_data)
     return LLVMConstNull(ty);
-  if (is_array(var->ty))
+  if (is_memory(var->ty))
     return bytes_const(var->init_data, var->ty->size);
 
   uint64_t v = read_le(var->init_data, var->ty->size);
@@ -379,7 +646,9 @@ static LLVMValueRef get_function(Obj *fn, Token *tok) {
   if (!fn->is_definition && !strcmp(fn->name, "alloca"))
     unsupported(tok, "alloca");
 
-  f = LLVMAddFunction(mod, fn->name, function_type(fn->ty, fn->tok ? fn->tok : tok));
+  FuncABI *abi = func_abi(fn->ty, NULL, fn->tok ? fn->tok : tok);
+  f = LLVMAddFunction(mod, fn->name, abi->fty);
+  add_abi_attrs(abi, f, NULL);
   if (fn->is_static)
     LLVMSetLinkage(f, LLVMInternalLinkage);
 
@@ -459,6 +728,69 @@ static void enter_label(char *name) {
 }
 
 //
+// Memory
+//
+
+// Temporaries go in the entry block so that a loop does not grow the stack.
+static LLVMValueRef entry_alloca(LLVMTypeRef ty, int align) {
+  LLVMBasicBlockRef entry = LLVMGetEntryBasicBlock(cur_fn);
+  LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
+  LLVMValueRef first = LLVMGetFirstInstruction(entry);
+  if (first)
+    LLVMPositionBuilderBefore(b, first);
+  else
+    LLVMPositionBuilderAtEnd(b, entry);
+  LLVMValueRef v = LLVMBuildAlloca(b, ty, "");
+  LLVMSetAlignment(v, align);
+  LLVMDisposeBuilder(b);
+  return v;
+}
+
+static LLVMValueRef load(LLVMTypeRef ty, LLVMValueRef addr, int align) {
+  LLVMValueRef v = LLVMBuildLoad2(bld, ty, addr, "");
+  LLVMSetAlignment(v, align);
+  return v;
+}
+
+static void store(LLVMValueRef v, LLVMValueRef addr, int align) {
+  LLVMSetAlignment(LLVMBuildStore(bld, v, addr), align);
+}
+
+static void copy_mem(LLVMValueRef dst, int dst_align, LLVMValueRef src, int src_align, int size) {
+  LLVMBuildMemCpy(bld, dst, dst_align, src, src_align, LLVMConstInt(i64_type(), size, false));
+}
+
+// Alignment known for the address of an lvalue or memory-typed expression.
+// Members are at most as aligned as their offset within the enclosing object
+// allows, which matters for packed structs.
+static int known_align(Node *node) {
+  if (node->kind != ND_MEMBER)
+    return node->ty->align > 0 ? node->ty->align : 1;
+  int align = known_align(node->lhs);
+  int off = node->member->offset;
+  while (off % align)
+    align /= 2;
+  return align;
+}
+
+// Spills a value of LLVM type `ty` holding an aggregate's memory image (an
+// argument or return value in registers) and copies the aggregate out.
+static void store_coerced(LLVMValueRef v, LLVMValueRef dst, Type *cty) {
+  LLVMValueRef tmp = entry_alloca(LLVMTypeOf(v), 16);
+  store(v, tmp, 16);
+  copy_mem(dst, cty->align, tmp, 16, cty->size);
+}
+
+// The reverse of store_coerced: loads an aggregate's memory image as `ty`.
+// The temporary is at least as large as `ty`, which may exceed the aggregate.
+static LLVMValueRef load_coerced(LLVMTypeRef ty, LLVMValueRef src, Type *cty) {
+  LLVMValueRef tmp = entry_alloca(ty, 16);
+  store(LLVMConstNull(ty), tmp, 16);
+  copy_mem(tmp, 16, src, cty->align, cty->size);
+  return load(ty, tmp, 16);
+}
+
+//
 // Value conversions
 //
 
@@ -485,6 +817,10 @@ static LLVMValueRef convert(LLVMValueRef v, Type *to, Type *from, Token *tok) {
     unsupported(tok, "use of a void value");
   // An array value is already the address of its first element.
   if (is_array(from) && to->kind == TY_PTR)
+    return v;
+  // Struct and union values are addresses. The frontend only converts between
+  // compatible types (assignment to a union, ?: and return).
+  if (is_aggregate(from) && is_aggregate(to))
     return v;
   if (!is_scalar(to) || !is_scalar(from))
     unsupported(tok, format("conversion from %s to %s", type_name(from), type_name(to)));
@@ -642,7 +978,7 @@ static LLVMValueRef gen_logical(Node *node) {
 
 static LLVMValueRef gen_cond_expr(Node *node) {
   bool is_void = node->ty->kind == TY_VOID;
-  if (!is_void && !is_scalar(node->ty))
+  if (!is_void && !is_scalar(node->ty) && !is_aggregate(node->ty))
     unsupported(node->tok, format("conditional expression of type %s", type_name(node->ty)));
 
   LLVMValueRef c = to_bool(gen_value(node->cond));
@@ -668,7 +1004,9 @@ static LLVMValueRef gen_cond_expr(Node *node) {
   position(end_bb);
   if (is_void)
     return NULL;
-  LLVMValueRef phi = LLVMBuildPhi(bld, scalar_type(node->ty), "");
+  // A struct or union operand's value is its address.
+  LLVMTypeRef ty = is_aggregate(node->ty) ? ptr_type() : scalar_type(node->ty);
+  LLVMValueRef phi = LLVMBuildPhi(bld, ty, "");
   LLVMValueRef vals[2] = {tv, ev};
   LLVMBasicBlockRef bbs[2] = {then_end, else_end};
   LLVMAddIncoming(phi, vals, bbs, 2);
@@ -678,40 +1016,115 @@ static LLVMValueRef gen_cond_expr(Node *node) {
 static LLVMValueRef gen_call(Node *node) {
   if (node->lhs->kind != ND_VAR || node->lhs->var->ty->kind != TY_FUNC)
     unsupported(node->tok, "indirect call");
-  if (node->pass_by_stack || node->ret_buffer)
-    unsupported(node->tok, "struct argument or return value");
 
   LLVMValueRef fn = get_function(node->lhs->var, node->tok);
-  LLVMTypeRef fty = LLVMGlobalGetValueType(fn);
 
+  // Arguments past the declared parameters are variadic (or unprototyped).
+  Node *extra = node->args;
+  for (Type *p = node->func_ty->params; p && extra; p = p->next)
+    extra = extra->next;
+  FuncABI *abi = func_abi(node->func_ty, extra, node->tok);
+
+  LLVMValueRef ret_buf = node->ret_buffer ? var_addr(node->ret_buffer, node->tok) : NULL;
+  LLVMValueRef *args = calloc(abi->nargs + 1, sizeof(LLVMValueRef));
   int n = 0;
-  for (Node *a = node->args; a; a = a->next)
-    n++;
+  if (abi->sret)
+    args[n++] = ret_buf;
 
-  LLVMValueRef *args = calloc(n ? n : 1, sizeof(LLVMValueRef));
-  Type *param = node->func_ty ? node->func_ty->params : NULL;
+  bool variadic = false;
   int i = 0;
   for (Node *a = node->args; a; a = a->next, i++) {
-    // Arrays only reach here as variadic arguments, which the frontend does
-    // not convert; their value is already the decayed pointer.
-    if (!is_scalar(a->ty) && !is_array(a->ty))
-      unsupported(a->tok, format("argument of type %s", type_name(a->ty)));
+    ArgABI *ai = &abi->args[i];
+    if (a == extra)
+      variadic = true;
+
     LLVMValueRef v = gen_value(a);
-    if (param) {
-      // Declared parameters were already converted by the frontend.
-      param = param->next;
-    } else if (is_integer(a->ty) && a->ty->size < 4) {
-      // Default argument promotion for variadic and unprototyped arguments:
-      // integers narrower than int are passed as int.
-      v = int_coerce(v, scalar_type(ty_int), a->ty->is_unsigned);
+    switch (ai->kind) {
+    case PASS_DIRECT:
+      // Default argument promotion: integers narrower than int are passed as
+      // int. Declared parameters were already converted by the frontend.
+      if (variadic && is_integer(a->ty) && a->ty->size < 4)
+        v = int_coerce(v, scalar_type(ty_int), a->ty->is_unsigned);
+      break;
+    case PASS_COERCE:
+      v = load_coerced(ai->ty, v, a->ty);
+      break;
+    case PASS_BYVAL:
+      // The call lowering makes the copy.
+      break;
+    case PASS_BYREF: {
+      LLVMValueRef copy = entry_alloca(storage_type(a->ty), a->ty->align);
+      copy_mem(copy, a->ty->align, v, known_align(a), a->ty->size);
+      v = copy;
+      break;
     }
-    args[i] = v;
+    }
+    args[n++] = v;
   }
 
-  LLVMValueRef r = LLVMBuildCall2(bld, fty, fn, args, n, "");
+  LLVMValueRef r = LLVMBuildCall2(bld, abi->fty, fn, args, n, "");
+  add_abi_attrs(abi, NULL, r);
+
   if (node->ty->kind == TY_VOID)
     return NULL;
+  if (abi->sret)
+    return ret_buf;
+  if (abi->ret.kind == PASS_COERCE) {
+    store_coerced(r, ret_buf, node->ty);
+    return ret_buf;
+  }
   return r;
+}
+
+static LLVMValueRef member_addr(Node *node) {
+  LLVMValueRef base = gen_addr(node->lhs);
+  if (!node->member->offset)
+    return base;
+  LLVMValueRef off = LLVMConstInt(i64_type(), node->member->offset, false);
+  return LLVMBuildGEP2(bld, i8_type(), base, &off, 1, "");
+}
+
+static bool bitfield_unsigned(Member *mem) {
+  return mem->ty->is_unsigned || mem->ty->kind == TY_BOOL;
+}
+
+// Sign- or zero-extends the low `width` bits of v to v's full width.
+static LLVMValueRef extend_bits(LLVMValueRef v, int width, bool is_unsigned) {
+  LLVMTypeRef ty = LLVMTypeOf(v);
+  int bits = LLVMGetIntTypeWidth(ty);
+  if (width == bits)
+    return v;
+  LLVMValueRef sh = LLVMConstInt(ty, bits - width, false);
+  v = LLVMBuildShl(bld, v, sh, "");
+  return is_unsigned ? LLVMBuildLShr(bld, v, sh, "") : LLVMBuildAShr(bld, v, sh, "");
+}
+
+// A bitfield is stored in a unit of its declared type at the member's offset.
+static LLVMValueRef load_bitfield(Node *node) {
+  Member *mem = node->member;
+  LLVMTypeRef ty = scalar_type(mem->ty);
+  LLVMValueRef v = load(ty, member_addr(node), known_align(node));
+  v = LLVMBuildLShr(bld, v, LLVMConstInt(ty, mem->bit_offset, false), "");
+  return extend_bits(v, mem->bit_width, bitfield_unsigned(mem));
+}
+
+// Read-modify-write of the bitfield's unit. Returns the value the bitfield
+// holds afterwards, as C requires of an assignment expression.
+static LLVMValueRef store_bitfield(Node *lhs, Node *rhs, Token *tok) {
+  Member *mem = lhs->member;
+  LLVMTypeRef ty = scalar_type(mem->ty);
+  LLVMValueRef addr = member_addr(lhs);
+  int align = known_align(lhs);
+  LLVMValueRef v = convert(gen_value(rhs), mem->ty, rhs->ty, tok);
+
+  uint64_t low = mem->bit_width >= 64 ? ~0ULL : (1ULL << mem->bit_width) - 1;
+  uint64_t mask = low << mem->bit_offset;
+  LLVMValueRef field = LLVMBuildAnd(bld, v, LLVMConstInt(ty, low, false), "");
+  field = LLVMBuildShl(bld, field, LLVMConstInt(ty, mem->bit_offset, false), "");
+  LLVMValueRef old = load(ty, addr, align);
+  old = LLVMBuildAnd(bld, old, LLVMConstInt(ty, ~mask, false), "");
+  store(LLVMBuildOr(bld, old, field, ""), addr, align);
+  return extend_bits(v, mem->bit_width, bitfield_unsigned(mem));
 }
 
 // Address of an lvalue. chibicc lowers compound assignment and ++/-- to
@@ -725,8 +1138,18 @@ static LLVMValueRef gen_addr(Node *node) {
       unsupported(node->tok, "dereference of a non-pointer");
     return gen_value(node->lhs);
   case ND_MEMBER:
-    unsupported(node->tok, "struct or union member access");
+    if (node->member->is_bitfield)
+      unsupported(node->tok, "address of a bitfield");
+    return member_addr(node);
+  case ND_COMMA:
+    // [GNU] `(a, b) = c`; compound literals are also lowered to this form.
+    gen_expr(node->lhs);
+    return gen_addr(node->rhs);
   default:
+    // Struct and union rvalues (call results, assignments, ?:, comma and
+    // statement expressions) evaluate to the address of their object.
+    if (is_aggregate(node->ty))
+      return gen_value(node);
     unsupported(node->tok, format("address of or assignment to %s", tok_text(node->tok)));
   }
 }
@@ -749,33 +1172,50 @@ static LLVMValueRef gen_expr(Node *node) {
   case ND_VAR:
     if (node->var->ty->kind == TY_FUNC)
       unsupported(node->tok, "function used as a value");
-    // The value of an array is the address of its first element.
-    if (is_array(node->ty))
+    // The value of an array, struct or union is its address.
+    if (is_memory(node->ty))
       return var_addr(node->var, node->tok);
     if (!is_scalar(node->ty))
       unsupported(node->tok, format("variable '%s' of type %s", node->var->name, type_name(node->ty)));
-    return LLVMBuildLoad2(bld, scalar_type(node->ty), var_addr(node->var, node->tok), "");
+    return load(scalar_type(node->ty), var_addr(node->var, node->tok), known_align(node));
 
   case ND_DEREF:
     if (!is_address(node->lhs->ty))
       unsupported(node->tok, "dereference of a non-pointer");
-    // Dereferencing a pointer to an array (e.g. a row of a 2D array) yields
-    // the array, whose value is its address.
-    if (is_array(node->ty))
+    // Dereferencing a pointer to an array (e.g. a row of a 2D array), struct
+    // or union yields that object, whose value is its address.
+    if (is_memory(node->ty))
       return gen_value(node->lhs);
     if (!is_scalar(node->ty))
       unsupported(node->tok, format("dereference of %s", type_name(node->ty)));
-    return LLVMBuildLoad2(bld, scalar_type(node->ty), gen_value(node->lhs), "");
+    return load(scalar_type(node->ty), gen_value(node->lhs), known_align(node));
+
+  case ND_MEMBER:
+    if (node->member->is_bitfield)
+      return load_bitfield(node);
+    if (is_memory(node->ty))
+      return member_addr(node);
+    if (!is_scalar(node->ty))
+      unsupported(node->tok, format("member of type %s", type_name(node->ty)));
+    return load(scalar_type(node->ty), member_addr(node), known_align(node));
 
   case ND_ADDR:
     return gen_addr(node->lhs);
 
   case ND_ASSIGN: {
+    if (node->lhs->kind == ND_MEMBER && node->lhs->member->is_bitfield)
+      return store_bitfield(node->lhs, node->rhs, node->tok);
+    if (is_aggregate(node->lhs->ty)) {
+      LLVMValueRef addr = gen_addr(node->lhs);
+      LLVMValueRef src = gen_value(node->rhs);
+      copy_mem(addr, known_align(node->lhs), src, known_align(node->rhs), node->lhs->ty->size);
+      return addr;
+    }
     if (!is_scalar(node->lhs->ty))
       unsupported(node->tok, format("assignment to %s", type_name(node->lhs->ty)));
     LLVMValueRef addr = gen_addr(node->lhs);
     LLVMValueRef v = convert(gen_value(node->rhs), node->lhs->ty, node->rhs->ty, node->tok);
-    LLVMBuildStore(bld, v, addr);
+    store(v, addr, known_align(node->lhs));
     return v;
   }
 
@@ -787,14 +1227,13 @@ static LLVMValueRef gen_expr(Node *node) {
     if (!is_storable(var->ty))
       unsupported(node->tok, format("variable '%s' of type %s", var->name, type_name(var->ty)));
     LLVMValueRef addr = var_addr(var, node->tok);
-    if (is_array(var->ty))
+    if (is_memory(var->ty))
       LLVMBuildMemSet(bld, addr, LLVMConstNull(i8_type()),
                       LLVMConstInt(i64_type(), var->ty->size, false), var->align);
     else
-      LLVMBuildStore(bld, LLVMConstNull(scalar_type(var->ty)), addr);
+      store(LLVMConstNull(scalar_type(var->ty)), addr, var->align);
     return NULL;
   }
-
   case ND_COMMA:
     gen_expr(node->lhs);
     return gen_expr(node->rhs);
@@ -844,9 +1283,6 @@ static LLVMValueRef gen_expr(Node *node) {
   case ND_FUNCALL:
     return gen_call(node);
 
-  case ND_MEMBER:
-    unsupported(node->tok, "struct or union member access");
-
   case ND_STMT_EXPR:
     // [GNU] ({ ... }) has the value of its last statement, which the frontend
     // guarantees is an expression statement.
@@ -868,6 +1304,15 @@ static LLVMValueRef gen_expr(Node *node) {
 // Statements
 //
 
+// Return without a value, or falling off the end of a function: returns zero
+// (or nothing, for void and sret functions).
+static void ret_default(void) {
+  if (cur_ret_ty->kind == TY_VOID || cur_abi->sret)
+    LLVMBuildRetVoid(bld);
+  else
+    LLVMBuildRet(bld, LLVMConstNull(cur_abi->ret.ty));
+}
+
 static void gen_return(Node *node) {
   if (cur_ret_ty->kind == TY_VOID) {
     if (node->lhs)
@@ -877,9 +1322,21 @@ static void gen_return(Node *node) {
   }
 
   if (!node->lhs) {
-    LLVMBuildRet(bld, LLVMConstNull(scalar_type(cur_ret_ty)));
+    ret_default();
     return;
   }
+
+  if (is_aggregate(cur_ret_ty)) {
+    LLVMValueRef src = gen_value(node->lhs);
+    if (cur_abi->sret) {
+      copy_mem(cur_sret, cur_ret_ty->align, src, known_align(node->lhs), cur_ret_ty->size);
+      LLVMBuildRetVoid(bld);
+    } else {
+      LLVMBuildRet(bld, load_coerced(cur_abi->ret.ty, src, cur_ret_ty));
+    }
+    return;
+  }
+
   LLVMValueRef v = convert(gen_value(node->lhs), cur_ret_ty, node->lhs->ty, node->tok);
   LLVMBuildRet(bld, v);
 }
@@ -1055,15 +1512,17 @@ static void emit_function(Obj *fn) {
   LLVMValueRef f = get_function(fn, fn->tok);
   cur_fn = f;
   cur_ret_ty = fn->ty->return_ty;
+  cur_abi = func_abi(fn->ty, NULL, fn->tok);
+  cur_sret = cur_abi->sret ? LLVMGetParam(f, 0) : NULL;
   local_binds = NULL;
   labels = NULL;
 
   LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, f, "entry");
   position(entry);
 
-  // Every local gets a stack slot in the entry block. Only scalars and
-  // fixed-size arrays are supported; other locals are diagnosed if they are
-  // referenced.
+  // Every local gets a stack slot in the entry block. Only scalars, fixed-size
+  // arrays, structs and unions are supported; other locals are diagnosed if
+  // they are referenced.
   for (Obj *v = fn->locals; v; v = v->next) {
     if (!is_storable(v->ty))
       continue;
@@ -1073,23 +1532,41 @@ static void emit_function(Obj *fn) {
     add_binding(&local_binds, v, slot);
   }
 
+  // For a struct or union returned in memory (larger than 16 bytes), the
+  // frontend puts a hidden pointer local for the legacy backend first in the
+  // parameter list. The return buffer here is cur_sret instead.
+  Obj *params = fn->params;
+  Type *rt = fn->ty->return_ty;
+  if ((rt->kind == TY_STRUCT || rt->kind == TY_UNION) && rt->size > 16)
+    params = params->next;
+
   int i = 0;
-  for (Obj *p = fn->params; p; p = p->next, i++) {
+  for (Obj *p = params; p; p = p->next, i++) {
     LLVMValueRef slot = find_binding(local_binds, p);
     if (!slot)
       unsupported(p->tok, format("parameter '%s' of type %s", p->name, type_name(p->ty)));
-    LLVMBuildStore(bld, LLVMGetParam(f, i), slot);
+
+    LLVMValueRef v = LLVMGetParam(f, abi_param_index(cur_abi, i));
+    switch (cur_abi->args[i].kind) {
+    case PASS_DIRECT:
+      store(v, slot, p->align);
+      break;
+    case PASS_COERCE:
+      store_coerced(v, slot, p->ty);
+      break;
+    case PASS_BYVAL:
+    case PASS_BYREF:
+      // The pointer is to a copy owned by this call; copying it into the
+      // parameter's own slot keeps every local in one place.
+      copy_mem(slot, p->align, v, p->ty->align, p->ty->size);
+      break;
+    }
   }
 
   gen_stmt(fn->body);
 
-  // Falling off the end returns zero, as the legacy backend does.
-  if (!is_terminated()) {
-    if (cur_ret_ty->kind == TY_VOID)
-      LLVMBuildRetVoid(bld);
-    else
-      LLVMBuildRet(bld, LLVMConstNull(scalar_type(cur_ret_ty)));
-  }
+  if (!is_terminated())
+    ret_default();
 }
 
 void llvm_codegen(Obj *prog, char *output_path, char *target) {

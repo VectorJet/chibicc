@@ -994,6 +994,14 @@ static void array_designator(Token **rest, Token *tok, Type *ty, int *begin, int
   *rest = skip(tok, "]");
 }
 
+// Unnamed bitfields (e.g. `int : 0;`) are not initialized by initializer
+// lists; positional initializers skip them.
+static Member *skip_unnamed_bitfields(Member *mem) {
+  while (mem && mem->is_bitfield && !mem->name)
+    mem = mem->next;
+  return mem;
+}
+
 // struct-designator = "." ident
 static Member *struct_designator(Token **rest, Token *tok, Type *ty) {
   Token *start = tok;
@@ -1010,6 +1018,9 @@ static Member *struct_designator(Token **rest, Token *tok, Type *ty) {
       }
       continue;
     }
+
+    if (!mem->name)
+      continue;
 
     // Regular struct member
     if (mem->name->len == tok->len && !strncmp(mem->name->loc, tok->loc, tok->len)) {
@@ -1156,7 +1167,7 @@ static void array_initializer2(Token **rest, Token *tok, Initializer *init, int 
 static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
   tok = skip(tok, "{");
 
-  Member *mem = init->ty->members;
+  Member *mem = skip_unnamed_bitfields(init->ty->members);
   bool first = true;
 
   while (!consume_end(rest, tok)) {
@@ -1167,13 +1178,13 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
     if (equal(tok, ".")) {
       mem = struct_designator(&tok, tok, init->ty);
       designation(&tok, tok, init->children[mem->idx]);
-      mem = mem->next;
+      mem = skip_unnamed_bitfields(mem->next);
       continue;
     }
 
     if (mem) {
       initializer2(&tok, tok, init->children[mem->idx]);
-      mem = mem->next;
+      mem = skip_unnamed_bitfields(mem->next);
     } else {
       tok = skip_excess_element(tok);
     }
@@ -1184,7 +1195,8 @@ static void struct_initializer1(Token **rest, Token *tok, Initializer *init) {
 static void struct_initializer2(Token **rest, Token *tok, Initializer *init, Member *mem) {
   bool first = true;
 
-  for (; mem && !is_end(tok); mem = mem->next) {
+  for (mem = skip_unnamed_bitfields(mem); mem && !is_end(tok);
+       mem = skip_unnamed_bitfields(mem->next)) {
     Token *start = tok;
 
     if (!first)
@@ -1219,9 +1231,19 @@ static void union_initializer(Token **rest, Token *tok, Initializer *init) {
     initializer2(&tok, tok->next, init->children[0]);
     consume(&tok, tok, ",");
     *rest = skip(tok, "}");
-  } else {
-    initializer2(rest, tok, init->children[0]);
+    return;
   }
+
+  // Like a struct, a union can be initialized with another union, e.g.
+  // `union U x = f();`.
+  Node *expr = assign(rest, tok);
+  add_type(expr);
+  if (expr->ty->kind == TY_UNION) {
+    init->expr = expr;
+    return;
+  }
+
+  initializer2(rest, tok, init->children[0]);
 }
 
 // initializer = string-initializer | array-initializer
@@ -1350,7 +1372,7 @@ static Node *create_lvar_init(Initializer *init, Type *ty, InitDesg *desg, Token
     return node;
   }
 
-  if (ty->kind == TY_UNION) {
+  if (ty->kind == TY_UNION && !init->expr) {
     Member *mem = init->mem ? init->mem : ty->members;
     InitDesg desg2 = {desg, 0, mem};
     return create_lvar_init(init->children[mem->idx], mem->ty, &desg2, tok);
@@ -1422,12 +1444,17 @@ write_gvar_data(Relocation *cur, Initializer *init, Type *ty, char *buf, int off
     return cur;
   }
 
+  // A struct or union initialized from another object of its type, e.g.
+  // `struct T x = y;`, is not a constant expression.
+  if ((ty->kind == TY_STRUCT || ty->kind == TY_UNION) && init->expr)
+    error_tok(init->expr->tok, "not a compile-time constant");
+
   if (ty->kind == TY_STRUCT) {
     for (Member *mem = ty->members; mem; mem = mem->next) {
       if (mem->is_bitfield) {
         Node *expr = init->children[mem->idx]->expr;
         if (!expr)
-          break;
+          continue;
 
         char *loc = buf + offset + mem->offset;
         uint64_t oldval = read_buf(loc, mem->ty->size);
@@ -2744,6 +2771,10 @@ static Member *get_struct_member(Type *ty, Token *tok) {
         return mem;
       continue;
     }
+
+    // Unnamed bitfield, e.g. `int : 0;`
+    if (!mem->name)
+      continue;
 
     // Regular struct member
     if (mem->name->len == tok->len &&
