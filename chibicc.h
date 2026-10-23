@@ -428,6 +428,14 @@ extern char *opt_target;
 void llvm_codegen(Obj *prog, char *output_path, char *target);
 
 //
+// sigil_backend.c (--backend=sigil: sigcc, Sigma's C compiler)
+//
+
+extern bool opt_backend_sigil;
+extern char *opt_sigil_prefix;
+void sigil_codegen(Obj *prog, FILE *out);
+
+//
 // unicode.c
 //
 

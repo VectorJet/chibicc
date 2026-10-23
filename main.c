@@ -78,6 +78,42 @@ static void configure_host_target(void) {
 #endif
 }
 
+// sigcc (--backend=sigil) compiles for one of sigil's targets: its system
+// headers, arch macros and plain-char signedness (--sigil-target=).
+static char *opt_sigil_target;
+
+static void configure_sigil_target(void) {
+  define_macro("__SIZEOF_INT128__", "16");
+  define_macro("__int128_t", "__int128");
+  define_macro("__uint128_t", "unsigned __int128");
+  define_macro("__sigcc__", "1");
+  char *t = opt_sigil_target ? opt_sigil_target : "amd64";
+  if (!strcmp(t, "amd64")) {
+    if (file_exists("/usr/x86_64-linux-gnu/include/bits"))
+      multiarch_include_dir = "/usr/x86_64-linux-gnu/include";
+    return;
+  }
+  undef_macro("__x86_64");
+  undef_macro("__x86_64__");
+  undef_macro("__amd64");
+  undef_macro("__amd64__");
+  define_macro("__CHAR_UNSIGNED__", "1");
+  ty_char->is_unsigned = true;
+  if (!strcmp(t, "arm64")) {
+    define_macro("__aarch64__", "1");
+    define_macro("__ARM_64BIT_STATE", "1");
+    multiarch_include_dir = file_exists("/usr/aarch64-linux-gnu/include/bits")
+      ? "/usr/aarch64-linux-gnu/include" : "/usr/include/aarch64-linux-gnu";
+  } else if (!strcmp(t, "rv64")) {
+    define_macro("__riscv", "1");
+    define_macro("__riscv_xlen", "64");
+    multiarch_include_dir = file_exists("/usr/riscv64-linux-gnu/include/bits")
+      ? "/usr/riscv64-linux-gnu/include" : "/usr/include/riscv64-linux-gnu";
+  } else {
+    error("unknown --sigil-target: %s (expected amd64, arm64 or rv64)", t);
+  }
+}
+
 static void add_default_include_paths(char *argv0) {
   // We expect that chibicc-specific include files are installed
   // to ./include relative to argv[0].
@@ -349,8 +385,20 @@ static void parse_args(int argc, char **argv) {
         opt_backend_llvm = true;
       else if (!strcmp(name, "legacy"))
         opt_backend_llvm = false;
+      else if (!strcmp(name, "sigil"))
+        opt_backend_sigil = true;
       else
-        error("unknown backend: %s (expected 'legacy' or 'llvm')", name);
+        error("unknown backend: %s (expected 'legacy', 'llvm' or 'sigil')", name);
+      continue;
+    }
+
+    if (!strncmp(argv[i], "--sigil-target=", 15)) {
+      opt_sigil_target = argv[i] + 15;
+      continue;
+    }
+
+    if (!strncmp(argv[i], "--sigil-prefix=", 15)) {
+      opt_sigil_prefix = argv[i] + 15;
       continue;
     }
 
@@ -388,6 +436,9 @@ static void parse_args(int argc, char **argv) {
 
   if (opt_target && !opt_backend_llvm)
     error("--target requires --backend=llvm");
+
+  if (opt_backend_sigil)
+    configure_sigil_target();
 
   if (opt_backend_llvm) {
 #ifndef CHIBICC_LLVM
@@ -607,6 +658,15 @@ static void cc1(void) {
   }
 
   Obj *prog = parse(tok);
+
+  // The sigIL backend writes sigIL text (sigcc, Sigma book 26.4.2).
+  if (opt_backend_sigil) {
+    FILE *out = open_file(output_file);
+    sigil_codegen(prog, out);
+    if (out != stdout)
+      fclose(out);
+    return;
+  }
 
   // The LLVM backend writes the object file itself.
   if (opt_backend_llvm) {
